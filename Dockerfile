@@ -11,10 +11,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TZ=UTC
 
 # Install system dependencies including archive tools
+# Note: unrar is replaced with unrar-free or we'll use rar/unrar from non-free
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # Archive tools
     p7zip-full \
-    unrar \
+    unrar-free \
     unzip \
     tar \
     gzip \
@@ -31,7 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Create necessary directories
-RUN mkdir -p /app/downloads /app/extracted /app/results /app/temp
+RUN mkdir -p /app/downloads /app/extracted /app/results /app/temp /app/logs
 
 # Copy requirements first for better caching
 COPY requirements.txt .
@@ -51,11 +52,14 @@ RUN useradd -m -u 1000 botuser && \
 USER botuser
 
 # Create volume mounts for persistent data
-VOLUME ["/app/downloads", "/app/extracted", "/app/results", "/app/temp"]
+VOLUME ["/app/downloads", "/app/extracted", "/app/results", "/app/temp", "/app/logs"]
+
+# Expose port for health checks
+EXPOSE 8000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import os; exit(0) if os.path.exists('/app/bot.pid') else exit(1)" || exit 1
+    CMD python -c "import requests; requests.get('http://localhost:8000/health')" || exit 1
 
-# Run the bot
+# Run the bot using the start script
 CMD ["python", "start.py"]
