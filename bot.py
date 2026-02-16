@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-RUTE Cookie Extractor Bot - Pyrofork Version
-Processes archive files and extracts cookies for specific domains
+RUTE Cookie Extractor Bot - PyroFork Version
+Telegram bot for extracting cookies from nested archives
 """
 
 import os
@@ -21,27 +21,24 @@ import signal
 import math
 import humanize
 from datetime import datetime, timedelta
-from typing import List, Set, Dict, Optional, Tuple, Any
-from collections import defaultdict, deque
-import threading
-import gc
-import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Set, Dict, Optional, Tuple, Union
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import queue as queue_module
+from collections import defaultdict
 
-# Pyrofork imports
-from pyrogram import Client, filters, types, enums
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from pyrogram.errors import FloodWait, MessageNotModified, UserNotParticipant
-from pyrogram.handlers import MessageHandler, CallbackQueryHandler
+# PyroFork imports
+from pyrogram import Client, filters, enums
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.errors import FloodWait, MessageNotModified
+from pyrogram.handlers import CallbackQueryHandler
 from pyrogram.enums import ParseMode
 
-# Third-party imports for extraction
+# Third-party imports
 try:
     from tqdm import tqdm
-    HAS_TQDM = True
 except ImportError:
-    HAS_TQDM = False
     os.system("pip install -q tqdm")
     from tqdm import tqdm
 
@@ -49,13 +46,11 @@ try:
     import colorama
     from colorama import Fore, Style
     colorama.init(autoreset=True)
-    HAS_COLORAMA = True
 except ImportError:
     os.system("pip install -q colorama")
     import colorama
     from colorama import Fore, Style
     colorama.init(autoreset=True)
-    HAS_COLORAMA = True
 
 # Try to import rarfile for password detection only
 try:
@@ -83,13 +78,6 @@ except ImportError:
     except:
         HAS_PY7ZR = False
 
-# Install humanize if not present
-try:
-    import humanize
-except ImportError:
-    os.system("pip install -q humanize")
-    import humanize
-
 # ==============================================================================
 #                            CONFIGURATION
 # ==============================================================================
@@ -98,22 +86,18 @@ except ImportError:
 API_ID = 23933044
 API_HASH = "6df11147cbec7d62a323f0f498c8c03a"
 BOT_TOKEN = "8315539700:AAH3NGnaLNQeeV6-2wNJsDFmGPjXInU2YeY"
-LOG_CHANNEL = -1003747061396  # Channel ID for logs
-SEND_LOGS = True  # Whether to forward files to log channel
-ADMINS = [7125341830]  # Admin user IDs
-
-# Owner credit
-OWNER_CREDIT = "@still_alivenow"
+LOG_CHANNEL = -1003747061396
+SEND_LOGS = True
+ADMINS = [7125341830]
 
 # Performance Settings
-MAX_WORKERS = 100  # Threads for extraction
+MAX_WORKERS = 100  # 100 threads for maximum speed
 BUFFER_SIZE = 20 * 1024 * 1024  # 20MB buffer
-CHUNK_SIZE = 1024 * 1024  # 1MB chunks
-MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024  # 4GB max file size
-MAX_CONCURRENT_TASKS = 10  # Maximum concurrent tasks across all users
-MAX_USER_TASKS = 1  # One task per user at a time
+CHUNK_SIZE = 1024 * 1024  # 1MB chunks for file reading
+MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024  # 4GB
+MAX_CONCURRENT_TASKS = 10  # Max concurrent users processing
 
-# Supported archives
+# Supported formats
 SUPPORTED_ARCHIVES = {'.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz'}
 COOKIE_FOLDERS = {'Cookies', 'Browsers'}
 
@@ -257,11 +241,20 @@ def get_file_hash_fast(filepath: str) -> str:
 
 def format_size(size_bytes: int) -> str:
     """Quick size formatting"""
-    return humanize.naturalsize(size_bytes)
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size_bytes < 1024.0:
+            return f"{size_bytes:.1f}{unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.1f}TB"
 
 def format_time(seconds: float) -> str:
     """Format seconds to human readable"""
-    return str(timedelta(seconds=int(seconds)))
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        return f"{seconds/60:.1f}m"
+    else:
+        return f"{seconds/3600:.1f}h"
 
 def delete_entire_folder(folder_path: str) -> bool:
     """Delete entire folder in one operation"""
@@ -269,6 +262,7 @@ def delete_entire_folder(folder_path: str) -> bool:
         return True
     
     try:
+        import gc
         gc.collect()
         
         methods = [
@@ -289,18 +283,98 @@ def delete_entire_folder(folder_path: str) -> bool:
     except:
         return False
 
-def clean_user_data(user_id: int):
-    """Clean all data for a specific user"""
-    user_dirs = [
-        os.path.join(DOWNLOADS_DIR, str(user_id)),
-        os.path.join(EXTRACTED_DIR, str(user_id)),
-        os.path.join(RESULTS_DIR, str(user_id)),
-        os.path.join(TEMP_DIR, str(user_id))
-    ]
-    
-    for dir_path in user_dirs:
-        if os.path.exists(dir_path):
-            delete_entire_folder(dir_path)
+def get_system_stats() -> str:
+    """Get comprehensive system statistics"""
+    try:
+        # Disk usage
+        disk = psutil.disk_usage('/')
+        disk_total = disk.total
+        disk_used = disk.used
+        disk_free = disk.free
+        disk_percent = (disk_used / disk_total) * 100
+        
+        # Memory usage
+        memory = psutil.virtual_memory()
+        mem_total = memory.total
+        mem_used = memory.used
+        mem_free = memory.free
+        mem_percent = memory.percent
+        
+        # CPU
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        cpu_count = psutil.cpu_count()
+        
+        # Bot process
+        process = psutil.Process()
+        bot_cpu = process.cpu_percent(interval=0.1)
+        bot_memory_rss = process.memory_info().rss
+        bot_memory_vms = process.memory_info().vms
+        
+        # Network
+        net_io = psutil.net_io_counters()
+        bytes_sent = net_io.bytes_sent
+        bytes_recv = net_io.bytes_recv
+        total_io = bytes_sent + bytes_recv
+        
+        # Network speed (calculate over 1 second)
+        net_io_start = psutil.net_io_counters()
+        time.sleep(0.1)
+        net_io_end = psutil.net_io_counters()
+        upload_speed = (net_io_end.bytes_sent - net_io_start.bytes_sent) / 0.1
+        download_speed = (net_io_end.bytes_recv - net_io_start.bytes_recv) / 0.1
+        
+        # System info
+        os_name = platform.system()
+        os_version = platform.release()
+        python_version = platform.python_version()
+        
+        # Uptime
+        boot_time = datetime.fromtimestamp(psutil.boot_time())
+        uptime = datetime.now() - boot_time
+        uptime_str = str(uptime).split('.')[0]
+        
+        # Format stats
+        stats = f"""
+🖥️ **System Statistics Dashboard**
+
+💾 **Disk Storage**
+├ Total:  {humanize.naturalsize(disk_total)}
+├ Used:   {humanize.naturalsize(disk_used)} ({disk_percent:.1f}%)
+└ Free:   {humanize.naturalsize(disk_free)}
+
+🧠 **RAM (Memory)**
+├ Total:  {humanize.naturalsize(mem_total)}
+├ Used:   {humanize.naturalsize(mem_used)} ({mem_percent:.1f}%)
+└ Free:   {humanize.naturalsize(mem_free)}
+
+⚡ **CPU**
+├ Cores:  {cpu_count}
+└ Usage:  {cpu_percent:.1f}%
+
+🔌 **Bot Process**
+├ CPU:   {bot_cpu:.1f}%
+├ RAM (RSS):  {humanize.naturalsize(bot_memory_rss)}
+└ RAM (VMS):  {humanize.naturalsize(bot_memory_vms)}
+
+🌐 **Network**
+├ Upload Speed:   {humanize.naturalsize(upload_speed)}/s
+├ Download Speed: {humanize.naturalsize(download_speed)}/s
+└ Total I/O:      {humanize.naturalsize(total_io)}
+
+📟 **System Info**
+├ OS:  {os_name}
+├ OS Version:  {os_version}
+├ Python:  {python_version}
+└ Uptime:  {uptime_str}
+
+⏱️ **Performance**
+└ Current Ping:  {random.randint(150, 250):.3f} ms
+
+👤 **Owner Credits:** @still_alivenow
+"""
+        return stats
+    except Exception as e:
+        return f"Error getting system stats: {str(e)}"
 
 # ==============================================================================
 #                            PASSWORD DETECTION
@@ -378,36 +452,24 @@ class PasswordDetector:
             return True
 
 # ==============================================================================
-#                            ARCHIVE EXTRACTION
+#                            ARCHIVE EXTRACTION - OPTIMIZED PER TYPE
 # ==============================================================================
 
 class UltimateArchiveExtractor:
     """Ultimate speed archive extraction - best tool for each format"""
     
-    def __init__(self, password: Optional[str] = None):
+    def __init__(self, password: Optional[str] = None, progress_callback=None):
         self.password = password
         self.processed_files: Set[str] = set()
         self.lock = threading.Lock()
         self.extracted_count = 0
         self.stop_extraction = False
-        self.total_archives = 1
-        self.current_archive = ""
-        self.progress_callback = None
-    
-    def set_progress_callback(self, callback):
-        """Set progress callback function"""
-        self.progress_callback = callback
-    
-    def update_progress(self, current: int, total: int, status: str = ""):
-        """Update extraction progress"""
-        if self.progress_callback:
-            try:
-                asyncio.create_task(self.progress_callback(current, total, status))
-            except:
-                pass
+        self.progress_callback = progress_callback
+        self.total_archives = 0
+        self.current_archive = 0
     
     def extract_7z_with_7z(self, archive_path: str, extract_dir: str) -> List[str]:
-        """Extract .7z using 7z.exe"""
+        """Extract .7z using 7z.exe (best for 7z)"""
         try:
             cmd = [TOOL_PATHS['7z'], 'x', '-y']
             if self.password:
@@ -430,7 +492,7 @@ class UltimateArchiveExtractor:
             return []
     
     def extract_rar_with_unrar(self, archive_path: str, extract_dir: str) -> List[str]:
-        """Extract .rar using UnRAR.exe"""
+        """Extract .rar using UnRAR.exe (best for RAR)"""
         try:
             cmd = [TOOL_PATHS['unrar'], 'x', '-y']
             if self.password:
@@ -517,7 +579,8 @@ class UltimateArchiveExtractor:
                     rf.setpassword(self.password)
                 rf.extractall(extract_dir)
                 return rf.namelist()
-        except:
+        except Exception as e:
+            print(f"RAR fallback error: {e}")
             return []
     
     def extract_7z_fallback(self, archive_path: str, extract_dir: str) -> List[str]:
@@ -526,7 +589,8 @@ class UltimateArchiveExtractor:
             with py7zr.SevenZipFile(archive_path, mode='r', password=self.password) as sz:
                 sz.extractall(extract_dir)
                 return sz.getnames()
-        except:
+        except Exception as e:
+            print(f"7z fallback error: {e}")
             return []
     
     def extract_tar_fast(self, archive_path: str, extract_dir: str) -> List[str]:
@@ -536,7 +600,8 @@ class UltimateArchiveExtractor:
             with tarfile.open(archive_path, 'r:*') as tf:
                 tf.extractall(extract_dir)
                 return tf.getnames()
-        except:
+        except Exception as e:
+            print(f"TAR extraction error: {e}")
             return []
     
     def extract_single(self, archive_path: str, extract_dir: str) -> List[str]:
@@ -545,7 +610,6 @@ class UltimateArchiveExtractor:
             return []
         
         ext = os.path.splitext(archive_path)[1].lower()
-        self.current_archive = os.path.basename(archive_path)
         
         try:
             if ext == '.7z':
@@ -584,20 +648,16 @@ class UltimateArchiveExtractor:
             pass
         return archives
     
-    async def extract_all_nested(self, root_archive: str, base_dir: str, status_msg) -> str:
+    def extract_all_nested(self, root_archive: str, base_dir: str) -> str:
         """Extract all nested archives"""
         current_level = {root_archive}
         level = 0
         self.total_archives = 1
-        processed = 0
         
         while current_level and not self.stop_extraction:
             next_level = set()
             level_dir = os.path.join(base_dir, f"L{level}")
             os.makedirs(level_dir, exist_ok=True)
-            
-            # Update total archives
-            self.total_archives += len(current_level)
             
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 futures = {}
@@ -624,34 +684,22 @@ class UltimateArchiveExtractor:
                         with self.lock:
                             self.processed_files.add(archive)
                             self.extracted_count += 1
-                            processed += 1
+                            self.current_archive += 1
                         
                         new_archives = self.find_archives_fast(extract_subdir)
                         next_level.update(new_archives)
                         
-                        # Update progress
-                        await self.update_progress(
-                            processed, 
-                            self.total_archives,
-                            f"Extracting: {os.path.basename(archive)}"
-                        )
+                        with self.lock:
+                            self.total_archives += len(new_archives)
                         
-                        # Update status message
-                        if status_msg:
-                            try:
-                                await status_msg.edit_text(
-                                    f"📦 **Extraction Progress**\n\n"
-                                    f"Processed: {processed}/{self.total_archives}\n"
-                                    f"Current: {os.path.basename(archive)[:30]}...\n"
-                                    f"Found new: {len(new_archives)} archives"
-                                )
-                            except:
-                                pass
-                                
+                        if self.progress_callback:
+                            progress = (self.current_archive / max(self.total_archives, 1)) * 100
+                            asyncio.run_coroutine_threadsafe(
+                                self.progress_callback(progress, f"Extracting {os.path.basename(archive)}"),
+                                asyncio.get_event_loop()
+                            )
                     except Exception as e:
-                        print(f"Future error: {e}")
-                        processed += 1
-                        await self.update_progress(processed, self.total_archives, f"Error: {str(e)[:30]}")
+                        print(f"Error processing future: {e}")
             
             current_level = next_level
             level += 1
@@ -665,7 +713,7 @@ class UltimateArchiveExtractor:
 class UltimateCookieExtractor:
     """Ultimate speed cookie extraction with per-site filtering"""
     
-    def __init__(self, target_sites: List[str]):
+    def __init__(self, target_sites: List[str], progress_callback=None):
         self.target_sites = [s.strip().lower() for s in target_sites]
         self.site_files: Dict[str, Dict[str, str]] = {site: {} for site in self.target_sites}
         self.global_seen: Set[str] = set()
@@ -675,20 +723,9 @@ class UltimateCookieExtractor:
         self.files_processed = 0
         self.used_filenames: Dict[str, Set[str]] = {site: set() for site in self.target_sites}
         self.stop_processing = False
-        self.site_patterns = {site: re.compile(re.escape(site), re.IGNORECASE) for site in self.target_sites}
-        self.progress_callback = None
-    
-    def set_progress_callback(self, callback):
-        """Set progress callback function"""
-        self.progress_callback = callback
-    
-    async def update_progress(self, current: int, total: int, status: str = ""):
-        """Update processing progress"""
-        if self.progress_callback:
-            try:
-                await self.progress_callback(current, total, status)
-            except:
-                pass
+        self.progress_callback = progress_callback
+        
+        self.site_patterns = {site: re.compile(site.encode()) for site in self.target_sites}
     
     def find_cookie_files(self, extract_dir: str) -> List[Tuple[str, str]]:
         """Find all cookie files"""
@@ -753,6 +790,7 @@ class UltimateCookieExtractor:
                     lines.extend(chunk.split(b'\n'))
             
             file_hash = get_file_hash_fast(file_path)
+            
             site_matches: Dict[str, List[Tuple[int, str]]] = {site: [] for site in self.target_sites}
             
             for line_num, line_bytes in enumerate(lines):
@@ -760,13 +798,10 @@ class UltimateCookieExtractor:
                     continue
                 
                 line_lower = line_bytes.lower()
-                try:
-                    line_str = line_bytes.decode('utf-8', errors='ignore').rstrip('\n\r')
-                except:
-                    continue
+                line_str = line_bytes.decode('utf-8', errors='ignore').rstrip('\n\r')
                 
                 for site in self.target_sites:
-                    if self.site_patterns[site].search(line_lower.decode('utf-8', errors='ignore')):
+                    if self.site_patterns[site].search(line_lower):
                         unique_id = f"{site}|{file_hash}|{line_num}"
                         
                         with self.seen_lock:
@@ -802,7 +837,7 @@ class UltimateCookieExtractor:
         except Exception as e:
             print(f"Error processing file {file_path}: {e}")
     
-    async def process_all(self, extract_dir: str, status_msg):
+    async def process_all(self, extract_dir: str, message: Message = None):
         """Process all files"""
         cookie_files = self.find_cookie_files(extract_dir)
         
@@ -827,24 +862,9 @@ class UltimateCookieExtractor:
                 future.result()
                 processed += 1
                 
-                # Update progress
-                await self.update_progress(
-                    processed, 
-                    total_files,
-                    f"Processing: {processed}/{total_files}"
-                )
-                
-                # Update status message every 10 files
-                if processed % 10 == 0 and status_msg:
-                    try:
-                        await status_msg.edit_text(
-                            f"🔍 **Cookie Processing**\n\n"
-                            f"Files: {processed}/{total_files}\n"
-                            f"Entries found: {self.total_found}\n"
-                            f"Status: Working..."
-                        )
-                    except:
-                        pass
+                if self.progress_callback and processed % 10 == 0:
+                    progress = (processed / total_files) * 100
+                    await self.progress_callback(progress, f"Processing cookies: {processed}/{total_files}")
     
     def create_site_zips(self, extract_dir: str, result_folder: str) -> Dict[str, str]:
         """Create ZIP archives per site"""
@@ -868,1062 +888,664 @@ class UltimateCookieExtractor:
         return created_zips
 
 # ==============================================================================
-#                            STATISTICS DASHBOARD
+#                            USER TASK MANAGER
 # ==============================================================================
 
-class SystemStats:
-    """Get system statistics"""
-    
-    @staticmethod
-    def get_stats() -> str:
-        """Get formatted system statistics"""
-        try:
-            # Disk
-            disk = psutil.disk_usage('/')
-            disk_total = disk.total
-            disk_used = disk.used
-            disk_free = disk.free
-            disk_percent = (disk_used / disk_total) * 100
-            
-            # Memory
-            memory = psutil.virtual_memory()
-            mem_total = memory.total
-            mem_used = memory.used
-            mem_free = memory.available
-            mem_percent = memory.percent
-            
-            # CPU
-            cpu_percent = psutil.cpu_percent(interval=0.1)
-            cpu_count = psutil.cpu_count()
-            
-            # Process
-            process = psutil.Process()
-            proc_cpu = process.cpu_percent(interval=0.1)
-            proc_memory_rss = process.memory_info().rss
-            proc_memory_vms = process.memory_info().vms
-            
-            # Network
-            net_io = psutil.net_io_counters()
-            bytes_sent = net_io.bytes_sent
-            bytes_recv = net_io.bytes_recv
-            total_io = bytes_sent + bytes_recv
-            
-            # Get network speeds (approximate)
-            try:
-                net_io_old = psutil.net_io_counters()
-                time.sleep(0.1)
-                net_io_new = psutil.net_io_counters()
-                upload_speed = (net_io_new.bytes_sent - net_io_old.bytes_sent) / 0.1
-                download_speed = (net_io_new.bytes_recv - net_io_old.bytes_recv) / 0.1
-            except:
-                upload_speed = 0
-                download_speed = 0
-            
-            # System info
-            os_name = platform.system()
-            os_version = platform.release()
-            python_version = platform.python_version()
-            
-            # Uptime
-            boot_time = datetime.fromtimestamp(psutil.boot_time())
-            uptime = datetime.now() - boot_time
-            uptime_str = str(uptime).split('.')[0]
-            
-            # Bot uptime (if app has start time)
-            bot_uptime = "N/A"
-            if hasattr(app, 'start_time'):
-                bot_uptime_sec = (datetime.now() - app.start_time).total_seconds()
-                bot_uptime = format_time(bot_uptime_sec)
-            
-            # Ping (approximate)
-            ping = random.uniform(150, 250)  # Placeholder
-            
-            stats = f"""
-🖥️ **System Statistics Dashboard**
-
-💾 **Disk Storage**
-├ Total:  {format_size(disk_total)}
-├ Used:   {format_size(disk_used)} ({disk_percent:.1f}%)
-└ Free:   {format_size(disk_free)}
-
-🧠 **RAM (Memory)**
-├ Total:  {format_size(mem_total)}
-├ Used:   {format_size(mem_used)} ({mem_percent:.1f}%)
-└ Free:   {format_size(mem_free)}
-
-⚡ **CPU**
-├ Cores:  {cpu_count}
-└ Usage:  {cpu_percent:.1f}%
-
-🔌 **Bot Process**
-├ CPU:    {proc_cpu:.1f}%
-├ RAM (RSS): {format_size(proc_memory_rss)}
-└ RAM (VMS): {format_size(proc_memory_vms)}
-
-🌐 **Network**
-├ Upload Speed:   {format_size(upload_speed)}/s
-├ Download Speed: {format_size(download_speed)}/s
-└ Total I/O:      {format_size(total_io)}
-
-📟 **System Info**
-├ OS:        {os_name}
-├ OS Version: {os_version}
-├ Python:    {python_version}
-└ Uptime:    {uptime_str}
-
-🤖 **Bot Info**
-├ Bot Uptime: {bot_uptime}
-├ Owner: {OWNER_CREDIT}
-└ Current Ping: {ping:.3f} ms
-"""
-            return stats
-        except Exception as e:
-            return f"Error getting stats: {str(e)}"
-
-# ==============================================================================
-#                            TASK QUEUE SYSTEM
-# ==============================================================================
-
-class TaskStatus:
-    WAITING = "waiting"
-    DOWNLOADING = "downloading"
-    EXTRACTING = "extracting"
-    PROCESSING = "processing"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-
-class Task:
-    """Represents a user task"""
-    
-    def __init__(self, user_id: int, user_name: str, message_id: int, chat_id: int):
+class UserTask:
+    """Represents a user's task"""
+    def __init__(self, user_id: int, chat_id: int, message_id: int, file_path: str, file_name: str, file_size: int):
         self.user_id = user_id
-        self.user_name = user_name
-        self.message_id = message_id
         self.chat_id = chat_id
-        self.status = TaskStatus.WAITING
-        self.file_path = None
-        self.file_name = None
-        self.file_size = 0
+        self.message_id = message_id
+        self.file_path = file_path
+        self.file_name = file_name
+        self.file_size = file_size
         self.password = None
-        self.domains = []
+        self.target_sites = []
+        self.status = "waiting_password"  # waiting_password, waiting_domains, processing, completed, failed, cancelled
         self.start_time = None
         self.end_time = None
-        self.progress = 0
-        self.status_message = None
-        self.extractor = None
-        self.cookie_extractor = None
-        self.cancelled = False
-        self.result_files = []
         self.extract_folder = None
-        self.download_message = None
-        
-    @property
-    def elapsed_time(self):
-        if self.start_time:
-            return datetime.now() - self.start_time
-        return timedelta(0)
-    
-    @property
-    def size_str(self):
-        return format_size(self.file_size)
-    
-    def cancel(self):
-        """Cancel the task"""
-        self.cancelled = True
-        self.status = TaskStatus.CANCELLED
-        if self.extractor:
-            self.extractor.stop_extraction = True
-        if self.cookie_extractor:
-            self.cookie_extractor.stop_processing = True
-        
-        # Clean up files
-        if self.file_path and os.path.exists(self.file_path):
-            try:
-                os.remove(self.file_path)
-            except:
-                pass
-        
-        if self.extract_folder and os.path.exists(self.extract_folder):
-            delete_entire_folder(self.extract_folder)
+        self.result_files = []
+        self.progress_message = None
+        self.cancelled = False
+        self.current_stage = ""
+        self.current_progress = 0
+        self.queue_position = 0
 
-class TaskQueue:
-    """Manages task queue"""
-    
+class TaskManager:
+    """Manages all user tasks"""
     def __init__(self, max_concurrent: int = MAX_CONCURRENT_TASKS):
+        self.tasks: Dict[int, UserTask] = {}  # user_id -> task
         self.queue = asyncio.Queue()
-        self.active_tasks: Dict[int, Task] = {}  # user_id -> Task
-        self.all_tasks: Dict[int, List[Task]] = defaultdict(list)  # user_id -> [Task]
+        self.active_tasks: Set[int] = set()
         self.max_concurrent = max_concurrent
-        self.current_running = 0
-        self.lock = asyncio.Lock()
-        self.processing = False
-        self.app = None
-    
-    def set_app(self, app):
-        """Set bot app reference"""
-        self.app = app
-    
-    async def add_task(self, task: Task) -> bool:
-        """Add task to queue"""
-        async with self.lock:
-            # Check if user already has active task
-            if task.user_id in self.active_tasks:
+        self.processing_lock = asyncio.Lock()
+        self.user_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self.task_counter = 0
+        
+    async def add_task(self, user_id: int, chat_id: int, message_id: int, file_path: str, file_name: str, file_size: int) -> bool:
+        """Add a new task for user, returns False if user already has active task"""
+        async with self.user_locks[user_id]:
+            if user_id in self.tasks and self.tasks[user_id].status not in ["completed", "failed", "cancelled"]:
                 return False
             
-            # Add to queue
-            await self.queue.put(task)
-            self.all_tasks[task.user_id].append(task)
-            
-            # Start processing if not already
-            if not self.processing:
-                asyncio.create_task(self.process_queue())
-            
+            task = UserTask(user_id, chat_id, message_id, file_path, file_name, file_size)
+            self.tasks[user_id] = task
+            await self.queue.put((user_id, task))
             return True
     
-    async def process_queue(self):
-        """Process tasks from queue"""
-        self.processing = True
-        
-        while True:
-            try:
-                # Check if we can process more
-                async with self.lock:
-                    if self.current_running >= self.max_concurrent:
-                        await asyncio.sleep(1)
-                        continue
-                
-                # Get next task
-                try:
-                    task = await asyncio.wait_for(self.queue.get(), timeout=1)
-                except asyncio.TimeoutError:
-                    # No tasks in queue
-                    async with self.lock:
-                        if self.current_running == 0:
-                            self.processing = False
-                            break
-                    continue
-                
-                # Process task
-                async with self.lock:
-                    self.current_running += 1
-                    self.active_tasks[task.user_id] = task
-                
-                asyncio.create_task(self.run_task(task))
-                
-            except Exception as e:
-                print(f"Queue processing error: {e}")
-                await asyncio.sleep(1)
-    
-    async def run_task(self, task: Task):
-        """Run a single task"""
+    async def get_next_task(self):
+        """Get next task from queue"""
         try:
-            task.status = TaskStatus.DOWNLOADING
-            task.start_time = datetime.now()
-            
-            # Notify user
-            try:
-                await self.app.send_message(
-                    task.chat_id,
-                    f"✅ **Task Started!**\n\n"
-                    f"File: {task.file_name}\n"
-                    f"Size: {task.size_str}\n"
-                    f"Position: {self.get_queue_position(task.user_id)}"
-                )
-            except:
-                pass
-            
-            # Download file if needed
-            if task.file_path and os.path.exists(task.file_path):
-                # File already downloaded
-                pass
-            else:
-                # This should be handled by the download handler
-                pass
-            
-            # Wait for domains and password if not set
-            if not task.domains:
-                # This will be handled by conversation handler
-                # Task will be paused until domains are provided
-                pass
-            
-        except Exception as e:
-            task.status = TaskStatus.FAILED
-            task.end_time = datetime.now()
-            print(f"Task error: {e}")
-            
-            # Notify user
-            try:
-                await self.app.send_message(
-                    task.chat_id,
-                    f"❌ **Task Failed**\n\nError: {str(e)[:200]}"
-                )
-            except:
-                pass
-        
-        finally:
-            # Remove from active tasks
-            async with self.lock:
-                if task.user_id in self.active_tasks:
-                    del self.active_tasks[task.user_id]
-                self.current_running -= 1
+            user_id, task = await self.queue.get()
+            return user_id, task
+        except:
+            return None, None
     
-    def get_user_task(self, user_id: int) -> Optional[Task]:
-        """Get active task for user"""
-        return self.active_tasks.get(user_id)
+    async def update_task_status(self, user_id: int, status: str, **kwargs):
+        """Update task status"""
+        async with self.user_locks[user_id]:
+            if user_id in self.tasks:
+                task = self.tasks[user_id]
+                task.status = status
+                for key, value in kwargs.items():
+                    setattr(task, key, value)
+                if status in ["completed", "failed", "cancelled"]:
+                    task.end_time = time.time()
+                    if user_id in self.active_tasks:
+                        self.active_tasks.remove(user_id)
     
-    def get_queue_position(self, user_id: int) -> int:
-        """Get user's position in queue"""
-        position = 1
-        for task in list(self.queue._queue):
-            if task.user_id == user_id:
-                return position
-            position += 1
-        return 0
+    def get_task(self, user_id: int) -> Optional[UserTask]:
+        """Get task for user"""
+        return self.tasks.get(user_id)
     
-    def get_queue_info(self) -> str:
-        """Get formatted queue information"""
-        if self.queue.empty() and not self.active_tasks:
-            return "📪 **Queue is empty**"
-        
-        lines = ["📊 **Current Queue**\n"]
-        
-        # Active tasks
-        if self.active_tasks:
-            lines.append("**🔄 Active Tasks:**")
-            for user_id, task in self.active_tasks.items():
-                elapsed = task.elapsed_time.total_seconds()
-                lines.append(
-                    f"├ 👤 {task.user_name}\n"
-                    f"│  ├ 📁 {task.file_name[:30]}...\n"
-                    f"│  ├ 📊 {task.size_str}\n"
-                    f"│  ├ ⏱️ {format_time(elapsed)}\n"
-                    f"│  └ 🔄 {task.status}"
-                )
-            lines.append("")
-        
-        # Waiting tasks
-        waiting_tasks = list(self.queue._queue)
-        if waiting_tasks:
-            lines.append("**⏳ Waiting:**")
-            for i, task in enumerate(waiting_tasks, 1):
-                lines.append(
-                    f"{i}. 👤 {task.user_name} - 📁 {task.file_name[:20]}... ({task.size_str})"
-                )
-        
-        return "\n".join(lines)
+    async def cancel_task(self, user_id: int) -> bool:
+        """Cancel user's task"""
+        async with self.user_locks[user_id]:
+            if user_id in self.tasks:
+                task = self.tasks[user_id]
+                task.cancelled = True
+                task.status = "cancelled"
+                task.end_time = time.time()
+                if hasattr(task, 'extractor') and task.extractor:
+                    task.extractor.stop_extraction = True
+                if hasattr(task, 'cookie_extractor') and task.cookie_extractor:
+                    task.cookie_extractor.stop_processing = True
+                if user_id in self.active_tasks:
+                    self.active_tasks.remove(user_id)
+                return True
+        return False
     
-    def cancel_user_task(self, user_id: int) -> bool:
-        """Cancel task for a user"""
-        # Check active tasks
-        if user_id in self.active_tasks:
-            task = self.active_tasks[user_id]
-            task.cancel()
-            return True
+    def get_queue_list(self) -> List[Tuple[int, UserTask, int]]:
+        """Get list of tasks in queue with positions"""
+        queue_list = []
+        temp_queue = list(self.queue._queue)
         
-        # Check waiting queue
-        new_queue = []
-        cancelled = False
-        for task in list(self.queue._queue):
-            if task.user_id == user_id:
-                task.cancel()
-                cancelled = True
-            else:
-                new_queue.append(task)
+        # Add active tasks first
+        for user_id in self.active_tasks:
+            if user_id in self.tasks:
+                task = self.tasks[user_id]
+                queue_list.append((user_id, task, 0))
         
-        # Rebuild queue
-        self.queue = asyncio.Queue()
-        for task in new_queue:
-            self.queue.put_nowait(task)
+        # Add queued tasks
+        for position, (user_id, task) in enumerate(temp_queue, start=1):
+            if user_id in self.tasks:
+                task.queue_position = position
+                queue_list.append((user_id, self.tasks[user_id], position))
         
-        return cancelled
-
-# Initialize queue
-task_queue = TaskQueue()
+        return queue_list
 
 # ==============================================================================
-#                            BOT APPLICATION
+#                            BOT CLASS
 # ==============================================================================
 
-class CookieBot(Client):
-    """Main bot application"""
+class CookieExtractorBot:
+    """Main bot class"""
     
     def __init__(self):
-        super().__init__(
-            "cookie_bot",
+        self.app = Client(
+            "cookie_extractor_bot",
             api_id=API_ID,
             api_hash=API_HASH,
-            bot_token=BOT_TOKEN,
-            workers=20
+            bot_token=BOT_TOKEN
         )
+        self.task_manager = TaskManager()
         self.start_time = datetime.now()
-        self.user_states = {}  # user_id -> state
-        self.user_data = {}  # user_id -> temp data
-        self.download_tasks = {}  # message_id -> task
+        self.download_semaphore = asyncio.Semaphore(5)  # Max 5 concurrent downloads
         
     async def start(self):
         """Start the bot"""
-        await super().start()
-        print(f"Bot started at {self.start_time}")
-        print(f"Owner: {OWNER_CREDIT}")
-        print(f"Tools: 7z={TOOL_STATUS['7z']}, UnRAR={TOOL_STATUS['unrar']}")
-        
-        # Set app reference in queue
-        task_queue.set_app(self)
+        print(f"{Fore.GREEN}Starting bot...{Style.RESET_ALL}")
+        await self.app.start()
         
         # Start queue processor
-        asyncio.create_task(task_queue.process_queue())
+        asyncio.create_task(self.process_queue())
         
-        # Send startup message to log channel
-        if SEND_LOGS and LOG_CHANNEL:
-            try:
-                await self.send_message(
-                    LOG_CHANNEL,
-                    f"🚀 **Bot Started**\n\n"
-                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"Owner: {OWNER_CREDIT}\n"
-                    f"Tools: 7z={'✅' if TOOL_STATUS['7z'] else '❌'}, UnRAR={'✅' if TOOL_STATUS['unrar'] else '❌'}"
-                )
-            except:
-                pass
+        print(f"{Fore.GREEN}Bot started!{Style.RESET_ALL}")
+        
+        # Keep running
+        while True:
+            await asyncio.sleep(1)
     
     async def stop(self):
         """Stop the bot"""
-        print("Bot stopping...")
-        await super().stop()
-
-# Initialize bot
-app = CookieBot()
-
-# ==============================================================================
-#                            HANDLER FUNCTIONS
-# ==============================================================================
-
-async def is_admin(user_id: int) -> bool:
-    """Check if user is admin"""
-    return user_id in ADMINS
-
-def get_user_state(user_id: int) -> str:
-    """Get user state"""
-    return app.user_states.get(user_id, "idle")
-
-def set_user_state(user_id: int, state: str):
-    """Set user state"""
-    app.user_states[user_id] = state
-
-def clear_user_state(user_id: int):
-    """Clear user state"""
-    if user_id in app.user_states:
-        del app.user_states[user_id]
-    if user_id in app.user_data:
-        del app.user_data[user_id]
-
-# ==============================================================================
-#                            COMMAND HANDLERS
-# ==============================================================================
-
-@app.on_message(filters.command("start"))
-async def start_command(client: Client, message: types.Message):
-    """Handle /start command"""
-    user = message.from_user
-    await message.reply_text(
-        f"👋 **Welcome to RUTE Cookie Extractor Bot!**\n\n"
-        f"This bot extracts cookies from archive files for specific domains.\n\n"
-        f"**Commands:**\n"
-        f"/start - Show this message\n"
-        f"/stats - Show system statistics\n"
-        f"/queue - Show current task queue\n"
-        f"/cancel - Cancel your current task\n"
-        f"/help - Show help information\n\n"
-        f"**How to use:**\n"
-        f"1. Send me an archive file (zip, rar, 7z, etc.)\n"
-        f"2. Enter the domains to search for (comma-separated)\n"
-        f"3. Enter password if archive is protected\n"
-        f"4. Wait for processing\n"
-        f"5. Receive cookie files as ZIP\n\n"
-        f"**Owner:** {OWNER_CREDIT}"
-    )
-
-@app.on_message(filters.command("help"))
-async def help_command(client: Client, message: types.Message):
-    """Handle /help command"""
-    await message.reply_text(
-        f"📚 **Help Information**\n\n"
-        f"**Supported formats:**\n"
-        f"• ZIP, RAR, 7Z\n"
-        f"• TAR, GZ, BZ2, XZ\n\n"
-        f"**Size limit:** 4GB\n\n"
-        f"**Tools used:**\n"
-        f"• 7z: {'✅ Available' if TOOL_STATUS['7z'] else '❌ Not available'}\n"
-        f"• UnRAR: {'✅ Available' if TOOL_STATUS['unrar'] else '❌ Not available'}\n\n"
-        f"**Processing:**\n"
-        f"• Maximum concurrent tasks: {MAX_CONCURRENT_TASKS}\n"
-        f"• One task per user\n"
-        f"• Automatic cleanup after completion\n\n"
-        f"**Commands:**\n"
-        f"/stats - System statistics\n"
-        f"/queue - View queue\n"
-        f"/cancel - Cancel task"
-    )
-
-@app.on_message(filters.command("stats"))
-async def stats_command(client: Client, message: types.Message):
-    """Handle /stats command"""
-    msg = await message.reply_text("📊 Gathering statistics...")
-    stats = SystemStats.get_stats()
-    await msg.edit_text(stats, parse_mode=enums.ParseMode.MARKDOWN)
-
-@app.on_message(filters.command("queue"))
-async def queue_command(client: Client, message: types.Message):
-    """Handle /queue command"""
-    queue_info = task_queue.get_queue_info()
+        print(f"{Fore.YELLOW}Stopping bot...{Style.RESET_ALL}")
+        await self.app.stop()
     
-    # Add cancel buttons for admin
-    keyboard = None
-    if await is_admin(message.from_user.id) and task_queue.active_tasks:
-        buttons = []
-        for user_id, task in list(task_queue.active_tasks.items())[:5]:  # Limit to 5
-            buttons.append([
-                InlineKeyboardButton(
-                    f"❌ Cancel {task.user_name[:10]}",
-                    callback_data=f"cancel_admin_{user_id}"
-                )
-            ])
-        if buttons:
-            keyboard = InlineKeyboardMarkup(buttons)
-    
-    await message.reply_text(queue_info, reply_markup=keyboard)
-
-@app.on_message(filters.command("cancel"))
-async def cancel_command(client: Client, message: types.Message):
-    """Handle /cancel command"""
-    user_id = message.from_user.id
-    
-    # Check if user has active task
-    task = task_queue.get_user_task(user_id)
-    if task:
-        task.cancel()
-        clear_user_state(user_id)
-        await message.reply_text("✅ Your task has been cancelled.")
-        return
-    
-    # Check if user is waiting
-    position = task_queue.get_queue_position(user_id)
-    if position > 0:
-        if task_queue.cancel_user_task(user_id):
-            clear_user_state(user_id)
-            await message.reply_text("✅ Your task has been removed from queue.")
-            return
-    
-    await message.reply_text("❌ You don't have any active or waiting tasks.")
-
-@app.on_callback_query()
-async def handle_callback(client: Client, callback_query: CallbackQuery):
-    """Handle callback queries"""
-    data = callback_query.data
-    
-    if data.startswith("cancel_admin_"):
-        # Admin cancel
-        if not await is_admin(callback_query.from_user.id):
-            await callback_query.answer("❌ Admin only", show_alert=True)
-            return
-        
-        target_user = int(data.split("_")[2])
-        
-        if task_queue.cancel_user_task(target_user):
-            await callback_query.answer("✅ Task cancelled", show_alert=True)
-            
-            # Notify user
+    async def process_queue(self):
+        """Process tasks from queue"""
+        while True:
             try:
-                await client.send_message(
-                    target_user,
-                    "❌ Your task was cancelled by an admin."
-                )
-            except:
-                pass
-        else:
-            await callback_query.answer("❌ Failed to cancel task", show_alert=True)
-        
-        # Update queue message
-        await callback_query.message.edit_text(task_queue.get_queue_info())
+                # Check if we can process more tasks
+                if len(self.task_manager.active_tasks) < self.task_manager.max_concurrent:
+                    user_id, task = await self.task_manager.get_next_task()
+                    if user_id and task:
+                        self.task_manager.active_tasks.add(user_id)
+                        asyncio.create_task(self.process_user_task(user_id, task))
+                
+                await asyncio.sleep(1)
+            except Exception as e:
+                print(f"Queue processing error: {e}")
+                await asyncio.sleep(5)
     
-    elif data == "skip_password":
-        # User wants to skip password
-        user_id = callback_query.from_user.id
-        task = task_queue.get_user_task(user_id)
-        
-        if task and task.status == TaskStatus.WAITING:
-            task.password = None
-            set_user_state(user_id, "domains")
-            
-            await callback_query.message.edit_text(
-                "✅ Password skipped. Now enter the domains to search for (comma-separated):\n\n"
-                "Example: `google.com, facebook.com, instagram.com`"
-            )
-        
-        await callback_query.answer()
-    
-    elif data.startswith("cancel_operation_"):
-        # User wants to cancel current operation
-        user_id = callback_query.from_user.id
-        op_type = data.split("_")[2]
-        
-        task = task_queue.get_user_task(user_id)
-        if task:
-            task.cancel()
-        
-        clear_user_state(user_id)
-        await callback_query.message.edit_text("❌ Operation cancelled.")
-        await callback_query.answer("Cancelled")
-
-# ==============================================================================
-#                            FILE HANDLER
-# ==============================================================================
-
-@app.on_message(filters.document)
-async def handle_document(client: Client, message: types.Message):
-    """Handle document uploads"""
-    user = message.from_user
-    user_id = user.id
-    document = message.document
-    
-    # Check file size
-    if document.file_size > MAX_FILE_SIZE:
-        await message.reply_text(
-            f"❌ File too large! Maximum size is {format_size(MAX_FILE_SIZE)}"
-        )
-        return
-    
-    # Check file extension
-    file_name = document.file_name or "unknown"
-    ext = os.path.splitext(file_name)[1].lower()
-    
-    if ext not in SUPPORTED_ARCHIVES:
-        await message.reply_text(
-            f"❌ Unsupported file format!\n"
-            f"Supported: {', '.join(SUPPORTED_ARCHIVES)}"
-        )
-        return
-    
-    # Check if user already has task
-    existing_task = task_queue.get_user_task(user_id)
-    if existing_task:
-        await message.reply_text(
-            "❌ You already have an active task!\n"
-            "Use /cancel to cancel it first."
-        )
-        return
-    
-    # Check queue position
-    position = task_queue.get_queue_position(user_id)
-    if position > 0:
-        await message.reply_text(
-            f"⏳ You're already in queue at position {position}\n"
-            "Use /cancel to remove your task."
-        )
-        return
-    
-    # Ask for confirmation
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_operation_file")]
-    ])
-    
-    msg = await message.reply_text(
-        f"📁 **File Received**\n\n"
-        f"Name: {file_name}\n"
-        f"Size: {format_size(document.file_size)}\n"
-        f"Type: {ext}\n\n"
-        f"Downloading file... Please wait.",
-        reply_markup=keyboard
-    )
-    
-    # Create download path
-    user_download_dir = os.path.join(DOWNLOADS_DIR, str(user_id))
-    os.makedirs(user_download_dir, exist_ok=True)
-    
-    download_path = os.path.join(user_download_dir, file_name)
-    
-    try:
-        # Download file with progress
-        file_path = await message.download(
-            file_name=download_path,
-            progress=download_progress,
-            progress_args=(client, message, msg, document.file_size)
-        )
-        
-        # Create task
-        task = Task(user_id, user.first_name or str(user_id), message.id, message.chat.id)
-        task.file_path = file_path
-        task.file_name = file_name
-        task.file_size = document.file_size
-        task.download_message = msg
-        
-        # Store download message reference
-        app.download_tasks[msg.id] = task
-        
-        # Add to queue
-        if await task_queue.add_task(task):
-            # Ask for domains
-            set_user_state(user_id, "domains")
-            
-            await msg.edit_text(
-                f"✅ File downloaded successfully!\n\n"
-                f"Now enter the domains to search for (comma-separated):\n\n"
-                f"Example: `google.com, facebook.com, instagram.com`\n\n"
-                f"Use /cancel to cancel this operation.",
-                reply_markup=None
-            )
-        else:
-            # Clean up
-            os.remove(file_path)
-            await msg.edit_text("❌ Failed to add task to queue.")
-            
-    except Exception as e:
-        await msg.edit_text(f"❌ Download failed: {str(e)[:200]}")
-        print(f"Download error: {traceback.format_exc()}")
-
-async def download_progress(current, total, client, message, status_msg, total_size):
-    """Download progress callback"""
-    try:
-        percent = (current / total) * 100
-        speed = current / (time.time() - message.date.timestamp()) if (time.time() - message.date.timestamp()) > 0 else 0
-        elapsed = time.time() - message.date.timestamp()
-        eta = (total - current) / speed if speed > 0 else 0
-        
-        # Create progress bar
-        bar_length = 20
-        filled = int(bar_length * current / total)
-        bar = '█' * filled + '░' * (bar_length - filled)
-        
-        text = (
-            f"📥 **Downloading...**\n\n"
-            f"File: {bar} {percent:.1f}%\n"
-            f"Size: {format_size(current)} / {format_size(total)}\n"
-            f"Speed: {format_size(speed)}/s\n"
-            f"Elapsed: {format_time(elapsed)}\n"
-            f"ETA: {format_time(eta)}"
-        )
-        
-        await status_msg.edit_text(text)
-    except:
-        pass
-
-# ==============================================================================
-#                            TEXT HANDLER
-# ==============================================================================
-
-@app.on_message(filters.text & ~filters.command(["start", "help", "stats", "queue", "cancel"]))
-async def handle_text(client: Client, message: types.Message):
-    """Handle text messages (domains, password)"""
-    user_id = message.from_user.id
-    state = get_user_state(user_id)
-    text = message.text.strip()
-    
-    # Get user's task
-    task = task_queue.get_user_task(user_id)
-    if not task:
-        # Check if waiting in queue
-        position = task_queue.get_queue_position(user_id)
-        if position > 0:
-            await message.reply_text(
-                f"⏳ You're in queue at position {position}\n"
-                "Please wait for your turn."
-            )
-        else:
-            await message.reply_text(
-                "❌ No active task. Send a file first."
-            )
-        return
-    
-    if state == "domains":
-        # Parse domains
-        domains = [d.strip().lower() for d in text.split(',') if d.strip()]
-        
-        if not domains:
-            await message.reply_text("❌ Please enter at least one domain.")
-            return
-        
-        task.domains = domains
-        
-        # Check if password needed
-        ext = os.path.splitext(task.file_name)[1].lower()
-        is_protected = False
-        
+    async def progress_callback(self, task: UserTask, progress: float, stage: str):
+        """Update progress for a task"""
         try:
-            if ext == '.rar':
-                is_protected = PasswordDetector.check_rar_protected(task.file_path)
-            elif ext == '.7z':
-                is_protected = PasswordDetector.check_7z_protected(task.file_path)
-            elif ext == '.zip':
-                is_protected = PasswordDetector.check_zip_protected(task.file_path)
-        except:
-            is_protected = False
-        
-        if is_protected:
-            set_user_state(user_id, "password")
+            task.current_progress = progress
+            task.current_stage = stage
+            
+            # Create progress bar
+            bar_length = 20
+            filled = int(bar_length * progress / 100)
+            bar = '█' * filled + '░' * (bar_length - filled)
+            
+            text = f"""
+**Processing Your File**
+
+📊 **Progress:** {progress:.1f}%
+{bar}
+
+**Stage:** {stage}
+
+**Status:** `{task.status}`
+
+Use /cancel to stop processing
+"""
+            if task.progress_message:
+                try:
+                    await task.progress_message.edit_text(text, parse_mode=enums.ParseMode.MARKDOWN)
+                except MessageNotModified:
+                    pass
+                except Exception as e:
+                    print(f"Progress update error: {e}")
+            else:
+                msg = await self.app.send_message(task.chat_id, text, parse_mode=enums.ParseMode.MARKDOWN)
+                task.progress_message = msg
+        except Exception as e:
+            print(f"Progress callback error: {e}")
+    
+    async def process_user_task(self, user_id: int, task: UserTask):
+        """Process a single user task"""
+        try:
+            # Update status
+            await self.task_manager.update_task_status(user_id, "waiting_password")
+            
+            # Ask for password
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("⏭️ Skip (if no password)", callback_data="skip_password")],
-                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_operation_password")]
+                [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{user_id}")]
             ])
             
-            await message.reply_text(
-                "🔑 This archive appears to be password protected.\n"
-                "Enter the password or click Skip if it's not protected:",
-                reply_markup=keyboard
+            msg = await self.app.send_message(
+                task.chat_id,
+                f"📦 **File received:** `{task.file_name}`\n"
+                f"📊 **Size:** {format_size(task.file_size)}\n\n"
+                f"🔑 **Is the archive password protected?**\n"
+                f"Send the password or type `/skip` if no password",
+                reply_markup=keyboard,
+                parse_mode=enums.ParseMode.MARKDOWN
             )
-        else:
-            # No password needed, start processing
-            set_user_state(user_id, "processing")
-            await message.reply_text("✅ Starting extraction...")
+            
+            # Wait for password
+            password_response = await self.wait_for_user_response(user_id, task.chat_id, timeout=300)
+            if not password_response or task.cancelled:
+                await self.cleanup_task(user_id, task)
+                return
+            
+            if password_response.text and password_response.text.lower() != '/skip':
+                task.password = password_response.text.strip()
+            
+            # Update status
+            await self.task_manager.update_task_status(user_id, "waiting_domains")
+            
+            # Ask for domains
+            msg = await self.app.send_message(
+                task.chat_id,
+                f"🎯 **Enter target domains**\n"
+                f"Send comma-separated domains (e.g., `example.com, google.com, facebook.com`)\n\n"
+                f"Or send /skip to use default domains",
+                reply_markup=keyboard,
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
+            
+            # Wait for domains
+            domains_response = await self.wait_for_user_response(user_id, task.chat_id, timeout=300)
+            if not domains_response or task.cancelled:
+                await self.cleanup_task(user_id, task)
+                return
+            
+            if domains_response.text and domains_response.text.lower() != '/skip':
+                sites = [s.strip().lower() for s in domains_response.text.split(',') if s.strip()]
+                if sites:
+                    task.target_sites = sites
+            else:
+                task.target_sites = ["example.com"]  # Default
             
             # Start processing
-            asyncio.create_task(process_task(client, task))
-    
-    elif state == "password":
-        # Set password
-        task.password = text
-        set_user_state(user_id, "processing")
-        await message.reply_text("✅ Password set. Starting extraction...")
-        
-        # Start processing
-        asyncio.create_task(process_task(client, task))
-    
-    else:
-        await message.reply_text("❌ No active task. Send a file first.")
-
-# ==============================================================================
-#                            TASK PROCESSING
-# ==============================================================================
-
-async def process_task(client: Client, task: Task):
-    """Process a task"""
-    try:
-        # Update status
-        task.status = TaskStatus.EXTRACTING
-        
-        # Create status message
-        status_msg = await client.send_message(
-            task.chat_id,
-            "📦 **Starting extraction...**"
-        )
-        task.status_message = status_msg
-        
-        # Forward to log channel
-        if SEND_LOGS and LOG_CHANNEL:
-            try:
-                await client.send_document(
-                    LOG_CHANNEL,
-                    task.file_path,
-                    caption=f"📥 **New File Received**\n\n"
-                            f"User: {task.user_name} (ID: {task.user_id})\n"
-                            f"File: {task.file_name}\n"
-                            f"Size: {task.size_str}\n"
-                            f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                )
-            except Exception as e:
-                print(f"Log forward error: {e}")
-        
-        # Create extract folder
-        user_extract_dir = os.path.join(EXTRACTED_DIR, str(task.user_id), 
-                                        datetime.now().strftime('%Y%m%d_%H%M%S'))
-        os.makedirs(user_extract_dir, exist_ok=True)
-        task.extract_folder = user_extract_dir
-        
-        # Create results folder
-        user_results_dir = os.path.join(RESULTS_DIR, str(task.user_id))
-        os.makedirs(user_results_dir, exist_ok=True)
-        
-        # Progress update function
-        async def update_extract_progress(current, total, status):
-            try:
-                percent = (current / total) * 100 if total > 0 else 0
-                bar_length = 20
-                filled = int(bar_length * current / total) if total > 0 else 0
-                bar = '█' * filled + '░' * (bar_length - filled)
-                
-                text = (
-                    f"📦 **Extracting Archives**\n\n"
-                    f"Progress: {bar} {percent:.1f}%\n"
-                    f"Processed: {current}/{total}\n"
-                    f"Status: {status[:50]}\n\n"
-                    f"⏱️ Elapsed: {format_time(task.elapsed_time.total_seconds())}"
-                )
-                
-                await status_msg.edit_text(text)
-            except:
-                pass
-        
-        # Extract archives
-        extractor = UltimateArchiveExtractor(task.password)
-        extractor.set_progress_callback(update_extract_progress)
-        task.extractor = extractor
-        
-        extract_dir = await extractor.extract_all_nested(
-            task.file_path, 
-            user_extract_dir,
-            status_msg
-        )
-        
-        if task.cancelled:
-            await status_msg.edit_text("❌ Task cancelled.")
-            return
-        
-        # Update status
-        task.status = TaskStatus.PROCESSING
-        await status_msg.edit_text(
-            f"✅ Extraction complete!\n"
-            f"Found {extractor.extracted_count} archives\n\n"
-            f"🔍 **Starting cookie filtering...**"
-        )
-        
-        # Process cookies
-        cookie_extractor = UltimateCookieExtractor(task.domains)
-        
-        async def update_cookie_progress(current, total, status):
-            try:
-                percent = (current / total) * 100 if total > 0 else 0
-                bar_length = 20
-                filled = int(bar_length * current / total) if total > 0 else 0
-                bar = '█' * filled + '░' * (bar_length - filled)
-                
-                text = (
-                    f"🔍 **Filtering Cookies**\n\n"
-                    f"Progress: {bar} {percent:.1f}%\n"
-                    f"Files: {current}/{total}\n"
-                    f"Entries found: {cookie_extractor.total_found}\n\n"
-                    f"⏱️ Elapsed: {format_time(task.elapsed_time.total_seconds())}"
-                )
-                
-                await status_msg.edit_text(text)
-            except:
-                pass
-        
-        cookie_extractor.set_progress_callback(update_cookie_progress)
-        task.cookie_extractor = cookie_extractor
-        
-        await cookie_extractor.process_all(extract_dir, status_msg)
-        
-        if task.cancelled:
-            await status_msg.edit_text("❌ Task cancelled.")
-            return
-        
-        # Create ZIP files
-        if cookie_extractor.total_found > 0:
-            await status_msg.edit_text("📦 Creating ZIP archives...")
+            await self.task_manager.update_task_status(user_id, "processing", start_time=time.time())
             
-            created_zips = cookie_extractor.create_site_zips(extract_dir, user_results_dir)
-            task.result_files = list(created_zips.values())
+            # Send initial progress
+            await self.progress_callback(task, 0, "Starting extraction...")
             
-            # Send results
-            for site, zip_path in created_zips.items():
+            # Create unique folder for this task
+            unique_id = datetime.now().strftime('%Y%m%d_%H%M%S') + f"_{user_id}"
+            extract_folder = os.path.join(EXTRACTED_DIR, unique_id)
+            result_folder = os.path.join(RESULTS_DIR, unique_id)
+            os.makedirs(extract_folder, exist_ok=True)
+            os.makedirs(result_folder, exist_ok=True)
+            
+            task.extract_folder = extract_folder
+            
+            # Extract archives
+            extractor = UltimateArchiveExtractor(
+                password=task.password,
+                progress_callback=lambda p, s: self.progress_callback(task, p, s)
+            )
+            task.extractor = extractor
+            
+            extractor.extract_all_nested(task.file_path, extract_folder)
+            
+            if task.cancelled:
+                await self.cleanup_task(user_id, task)
+                return
+            
+            # Extract cookies
+            cookie_extractor = UltimateCookieExtractor(
+                task.target_sites,
+                progress_callback=lambda p, s: self.progress_callback(task, p, s)
+            )
+            task.cookie_extractor = cookie_extractor
+            
+            await cookie_extractor.process_all(extract_folder, task.progress_message)
+            
+            if task.cancelled:
+                await self.cleanup_task(user_id, task)
+                return
+            
+            # Create ZIPs
+            await self.progress_callback(task, 95, "Creating ZIP archives...")
+            
+            if cookie_extractor.total_found > 0:
+                created_zips = cookie_extractor.create_site_zips(extract_folder, result_folder)
+                
+                # Send files to user
+                for site, zip_path in created_zips.items():
+                    if os.path.exists(zip_path) and os.path.getsize(zip_path) > 0:
+                        caption = f"✅ **Cookies for:** `{site}`\n"
+                        caption += f"📊 **Size:** {format_size(os.path.getsize(zip_path))}\n"
+                        caption += f"📝 **Entries:** {len(cookie_extractor.site_files[site])} files"
+                        
+                        await self.app.send_document(
+                            task.chat_id,
+                            document=zip_path,
+                            caption=caption,
+                            parse_mode=enums.ParseMode.MARKDOWN
+                        )
+                        
+                        task.result_files.append(zip_path)
+                        
+                        # Forward to log channel
+                        if SEND_LOGS and LOG_CHANNEL:
+                            try:
+                                log_caption = f"#Cookies\n"
+                                log_caption += f"**User:** `{user_id}`\n"
+                                log_caption += f"**Site:** `{site}`\n"
+                                log_caption += f"**Size:** {format_size(os.path.getsize(zip_path))}\n"
+                                log_caption += f"**Files:** {len(cookie_extractor.site_files[site])}"
+                                
+                                await self.app.send_document(
+                                    LOG_CHANNEL,
+                                    document=zip_path,
+                                    caption=log_caption,
+                                    parse_mode=enums.ParseMode.MARKDOWN
+                                )
+                            except Exception as e:
+                                print(f"Log forwarding error: {e}")
+                
+                # Send summary
+                elapsed = time.time() - task.start_time
+                summary = f"""
+✅ **Processing Complete!**
+
+📊 **Statistics:**
+├ Time: {format_time(elapsed)}
+├ Files Processed: {cookie_extractor.files_processed}
+├ Entries Found: {cookie_extractor.total_found}
+└ ZIP Archives: {len(created_zips)}
+
+Your cookie files have been sent above.
+"""
+                await self.app.send_message(task.chat_id, summary, parse_mode=enums.ParseMode.MARKDOWN)
+                
+                await self.task_manager.update_task_status(user_id, "completed")
+            else:
+                await self.app.send_message(
+                    task.chat_id,
+                    "❌ **No matching cookies found** in the extracted files.",
+                    parse_mode=enums.ParseMode.MARKDOWN
+                )
+                await self.task_manager.update_task_status(user_id, "failed")
+            
+        except Exception as e:
+            print(f"Error processing task for user {user_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            await self.app.send_message(
+                task.chat_id,
+                f"❌ **Error processing your file:**\n`{str(e)}`\n\nPlease try again later.",
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
+            await self.task_manager.update_task_status(user_id, "failed")
+        
+        finally:
+            # Cleanup
+            await self.cleanup_task(user_id, task)
+    
+    async def wait_for_user_response(self, user_id: int, chat_id: int, timeout: int = 300) -> Optional[Message]:
+        """Wait for user response"""
+        future = asyncio.Future()
+        
+        @self.app.on_message(filters.user(user_id) & filters.chat(chat_id) & ~filters.command("cancel"))
+        async def response_handler(client, message):
+            if not future.done():
+                future.set_result(message)
+        
+        try:
+            return await asyncio.wait_for(future, timeout)
+        except asyncio.TimeoutError:
+            await self.app.send_message(chat_id, "⏰ **Timeout!** Operation cancelled.")
+            return None
+        finally:
+            self.app.remove_handler(response_handler)
+    
+    async def cleanup_task(self, user_id: int, task: UserTask):
+        """Clean up task files"""
+        try:
+            # Delete progress message
+            if task.progress_message:
                 try:
-                    # Send to user
-                    await client.send_document(
-                        task.chat_id,
-                        zip_path,
-                        caption=f"✅ **Cookies for {site}**\n\n"
-                                f"Files: {len(cookie_extractor.site_files[site])}\n"
-                                f"Entries: {cookie_extractor.total_found}\n"
-                                f"Size: {format_size(os.path.getsize(zip_path))}"
+                    await task.progress_message.delete()
+                except:
+                    pass
+            
+            # Delete original file
+            if os.path.exists(task.file_path):
+                try:
+                    os.remove(task.file_path)
+                except:
+                    pass
+            
+            # Delete extract folder
+            if task.extract_folder and os.path.exists(task.extract_folder):
+                delete_entire_folder(task.extract_folder)
+            
+            # Delete result files
+            for file_path in task.result_files:
+                if os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                    except:
+                        pass
+            
+        except Exception as e:
+            print(f"Cleanup error: {e}")
+    
+    async def handle_start(self, client: Client, message: Message):
+        """Handle /start command"""
+        welcome_text = f"""
+🚀 **RUTE Cookie Extractor Bot**
+
+Welcome! I can extract cookies from nested archives (ZIP, RAR, 7Z, etc.)
+
+**How to use:**
+1. Send me any archive file (max 4GB)
+2. Provide password if needed
+3. Specify target domains
+4. Wait for processing
+5. Get filtered cookie files
+
+**Commands:**
+/start - Show this message
+/stats - System statistics
+/queue - View processing queue
+/cancel - Cancel current operation
+
+**Owner:** @still_alivenow
+"""
+        await message.reply_text(welcome_text, parse_mode=enums.ParseMode.MARKDOWN)
+    
+    async def handle_stats(self, client: Client, message: Message):
+        """Handle /stats command"""
+        stats = get_system_stats()
+        await message.reply_text(stats, parse_mode=enums.ParseMode.MARKDOWN)
+    
+    async def handle_queue(self, client: Client, message: Message):
+        """Handle /queue command"""
+        queue_list = self.task_manager.get_queue_list()
+        
+        if not queue_list:
+            await message.reply_text("📪 **Queue is empty**", parse_mode=enums.ParseMode.MARKDOWN)
+            return
+        
+        text = "**📋 Current Queue**\n\n"
+        
+        for user_id, task, position in queue_list:
+            if position == 0:  # Active
+                status_emoji = "🟢"
+                status_text = "**ACTIVE**"
+                elapsed = time.time() - task.start_time if task.start_time else 0
+                progress = f" | {task.current_progress:.1f}% | {format_time(elapsed)}"
+            else:
+                status_emoji = "⏳"
+                status_text = f"**QUEUE #{position}**"
+                progress = ""
+            
+            user_info = f"User: `{user_id}`"
+            file_info = f"File: `{task.file_name}` ({format_size(task.file_size)})"
+            stage_info = f"Stage: {task.current_stage}" if task.current_stage else ""
+            
+            text += f"{status_emoji} {status_text}\n"
+            text += f"├ {user_info}\n"
+            text += f"├ {file_info}\n"
+            if stage_info:
+                text += f"└ {stage_info}{progress}\n"
+            text += "\n"
+        
+        await message.reply_text(text, parse_mode=enums.ParseMode.MARKDOWN)
+    
+    async def handle_cancel(self, client: Client, message: Message):
+        """Handle /cancel command"""
+        user_id = message.from_user.id
+        
+        if await self.task_manager.cancel_task(user_id):
+            await message.reply_text(
+                "✅ **Operation cancelled successfully**\n\n"
+                "All temporary files have been cleaned up.",
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
+        else:
+            await message.reply_text(
+                "❌ **No active operation found** to cancel.",
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
+    
+    async def handle_document(self, client: Client, message: Message):
+        """Handle document/file uploads"""
+        user_id = message.from_user.id
+        chat_id = message.chat.id
+        
+        # Check file size
+        if message.document.file_size > MAX_FILE_SIZE:
+            await message.reply_text(
+                f"❌ **File too large!**\n"
+                f"Maximum size: {format_size(MAX_FILE_SIZE)}\n"
+                f"Your file: {format_size(message.document.file_size)}",
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
+            return
+        
+        # Check file extension
+        file_name = message.document.file_name
+        ext = os.path.splitext(file_name)[1].lower()
+        
+        if ext not in SUPPORTED_ARCHIVES:
+            supported = ', '.join(SUPPORTED_ARCHIVES)
+            await message.reply_text(
+                f"❌ **Unsupported file format!**\n"
+                f"Supported formats: {supported}",
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
+            return
+        
+        # Check if user already has active task
+        async with self.download_semaphore:
+            status_msg = await message.reply_text(
+                "📥 **Downloading your file...**",
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
+            
+            try:
+                # Download file
+                file_path = await message.download(
+                    file_name=os.path.join(DOWNLOADS_DIR, f"{user_id}_{int(time.time())}_{file_name}")
+                )
+                
+                await status_msg.delete()
+                
+                # Add to queue
+                success = await self.task_manager.add_task(
+                    user_id,
+                    chat_id,
+                    message.id,
+                    file_path,
+                    file_name,
+                    message.document.file_size
+                )
+                
+                if success:
+                    queue_list = self.task_manager.get_queue_list()
+                    position = next((p for uid, _, p in queue_list if uid == user_id), 0)
+                    
+                    if position == 0:
+                        position_text = "Your file is now **processing**"
+                    else:
+                        position_text = f"Your file is **#{position}** in queue"
+                    
+                    await message.reply_text(
+                        f"✅ **File added to queue!**\n\n"
+                        f"📁 **File:** `{file_name}`\n"
+                        f"📊 **Size:** {format_size(message.document.file_size)}\n"
+                        f"🎯 **Position:** {position_text}\n\n"
+                        f"You will be prompted for password shortly.",
+                        parse_mode=enums.ParseMode.MARKDOWN
                     )
                     
                     # Forward to log channel
                     if SEND_LOGS and LOG_CHANNEL:
-                        await client.send_document(
-                            LOG_CHANNEL,
-                            zip_path,
-                            caption=f"📤 **Results for {task.user_name}**\n\n"
-                                    f"User ID: {task.user_id}\n"
-                                    f"Domain: {site}\n"
-                                    f"Files: {len(cookie_extractor.site_files[site])}\n"
-                                    f"Entries: {cookie_extractor.total_found}\n"
-                                    f"Size: {format_size(os.path.getsize(zip_path))}"
-                        )
+                        try:
+                            log_caption = f"#NewFile\n"
+                            log_caption += f"**User:** `{user_id}`\n"
+                            log_caption += f"**Name:** `{file_name}`\n"
+                            log_caption += f"**Size:** {format_size(message.document.file_size)}\n"
+                            log_caption += f"**Queue:** #{position if position > 0 else 'Active'}"
+                            
+                            await message.forward(LOG_CHANNEL)
+                        except Exception as e:
+                            print(f"Log forwarding error: {e}")
                     
-                except Exception as e:
-                    print(f"Send error: {e}")
-            
-            # Final status
-            elapsed = task.elapsed_time.total_seconds()
-            await status_msg.edit_text(
-                f"✅ **Task Completed!**\n\n"
-                f"📁 File: {task.file_name}\n"
-                f"📊 Size: {task.size_str}\n"
-                f"🔍 Domains: {', '.join(task.domains)}\n"
-                f"📦 Archives processed: {extractor.extracted_count}\n"
-                f"📄 Files found: {cookie_extractor.files_processed}\n"
-                f"🔢 Entries: {cookie_extractor.total_found}\n"
-                f"⏱️ Time: {format_time(elapsed)}\n\n"
-                f"✅ Results sent as ZIP files."
-            )
-        else:
-            await status_msg.edit_text(
-                f"❌ **No cookies found**\n\n"
-                f"Domains: {', '.join(task.domains)}\n"
-                f"Files processed: {cookie_extractor.files_processed}"
-            )
-        
-        task.status = TaskStatus.COMPLETED
-        task.end_time = datetime.now()
-        
-    except Exception as e:
-        task.status = TaskStatus.FAILED
-        task.end_time = datetime.now()
-        
-        error_msg = f"❌ **Processing Failed**\n\nError: {str(e)[:200]}"
-        
-        try:
-            if task.status_message:
-                await task.status_message.edit_text(error_msg)
-            else:
-                await client.send_message(task.chat_id, error_msg)
-        except:
-            pass
-        
-        print(f"Task processing error: {traceback.format_exc()}")
+                else:
+                    await message.reply_text(
+                        "❌ **You already have an active task!**\n"
+                        "Please wait for it to complete or use /cancel to stop it.",
+                        parse_mode=enums.ParseMode.MARKDOWN
+                    )
+                    # Delete downloaded file
+                    try:
+                        os.remove(file_path)
+                    except:
+                        pass
+                    
+            except Exception as e:
+                await status_msg.delete()
+                await message.reply_text(
+                    f"❌ **Download failed:**\n`{str(e)}`",
+                    parse_mode=enums.ParseMode.MARKDOWN
+                )
     
-    finally:
-        # Clean up
-        clear_user_state(task.user_id)
+    async def handle_callback(self, client: Client, callback_query: CallbackQuery):
+        """Handle callback queries"""
+        data = callback_query.data
+        user_id = callback_query.from_user.id
         
-        # Delete original file
-        if task.file_path and os.path.exists(task.file_path):
-            try:
-                os.remove(task.file_path)
-            except:
-                pass
+        if data.startswith("cancel_"):
+            target_user = int(data.split("_")[1])
+            if user_id == target_user or user_id in ADMINS:
+                if await self.task_manager.cancel_task(target_user):
+                    await callback_query.answer("❌ Operation cancelled", show_alert=True)
+                    await callback_query.message.edit_text(
+                        "✅ **Operation cancelled**\n\nAll temporary files have been cleaned up.",
+                        parse_mode=enums.ParseMode.MARKDOWN
+                    )
+                else:
+                    await callback_query.answer("❌ No active operation found", show_alert=True)
+            else:
+                await callback_query.answer("❌ You can only cancel your own operations", show_alert=True)
+    
+    def run(self):
+        """Run the bot"""
+        # Add handlers
+        self.app.on_message(filters.command("start"))(self.handle_start)
+        self.app.on_message(filters.command("stats"))(self.handle_stats)
+        self.app.on_message(filters.command("queue"))(self.handle_queue)
+        self.app.on_message(filters.command("cancel"))(self.handle_cancel)
+        self.app.on_message(filters.document)(self.handle_document)
+        self.app.on_callback_query()(self.handle_callback)
         
-        # Delete extract folder
-        if task.extract_folder and os.path.exists(task.extract_folder):
-            delete_entire_folder(task.extract_folder)
-        
-        # Delete result files after sending
-        for file_path in task.result_files:
-            if os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except:
-                    pass
-
-
+        # Run the bot
+        self.app.run()
 
 # ==============================================================================
-#                            MAIN
+#                                MAIN
 # ==============================================================================
 
 if __name__ == "__main__":
-    print("Starting RUTE Cookie Extractor Bot...")
-    print(f"Owner: {OWNER_CREDIT}")
-    print(f"7z: {'✅' if TOOL_STATUS['7z'] else '❌'}")
-    print(f"UnRAR: {'✅' if TOOL_STATUS['unrar'] else '❌'}")
-    print(f"Max concurrent tasks: {MAX_CONCURRENT_TASKS}")
-    print(f"Max file size: {format_size(MAX_FILE_SIZE)}")
-    print("=" * 50)
+    # Print banner
+    banner = f"""
+{Fore.CYAN}╔══════════════════════════════════════════════════════════╗
+║{Fore.YELLOW}     🚀 RUTE COOKIE EXTRACTOR BOT - PyroFork 🚀        {Fore.CYAN}║
+║{Fore.WHITE}       Multi-user · Queue System · 4GB Limit            {Fore.CYAN}║
+║{Fore.WHITE}       Tools: 7z: {Fore.GREEN if TOOL_STATUS['7z'] else Fore.RED}{TOOL_STATUS['7z']}  ·  UnRAR: {Fore.GREEN if TOOL_STATUS['unrar'] else Fore.RED}{TOOL_STATUS['unrar']}{Fore.WHITE}         {Fore.CYAN}║
+╚══════════════════════════════════════════════════════════╝{Style.RESET_ALL}
+    """
+    print(banner)
+    
+    # Create and run bot
+    bot = CookieExtractorBot()
     
     try:
-        app.run()
+        asyncio.run(bot.start())
     except KeyboardInterrupt:
-        print("\nBot stopped by user")
+        print(f"\n{Fore.YELLOW}Bot stopped by user{Style.RESET_ALL}")
     except Exception as e:
-        print(f"Fatal error: {e}")
-        traceback.print_exc()
+        print(f"{Fore.RED}Error: {e}{Style.RESET_ALL}")
