@@ -1905,22 +1905,7 @@ async def process_task(client: Client, task: Task):
                 except:
                     pass
 
-# ==============================================================================
-#                            ERROR HANDLER
-# ==============================================================================
 
-@app.on_errors()
-async def error_handler(client: Client, error: Exception, message: types.Message = None):
-    """Global error handler"""
-    try:
-        error_msg = f"❌ **An error occurred**\n\nType: {type(error).__name__}"
-        
-        if message:
-            await message.reply_text(error_msg)
-        
-        print(f"Global error: {traceback.format_exc()}")
-    except:
-        pass
 
 # ==============================================================================
 #                            MAIN
