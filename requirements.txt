@@ -1,7 +1,8 @@
 # Core dependencies
 pyrofork
 tgcrypto
-
+aiofiles
+aiohttps
 # System utilities
 psutil
 humanize
