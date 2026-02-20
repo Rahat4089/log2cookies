@@ -92,7 +92,7 @@ ADMINS = [7125341830]  # List of admin user IDs
 MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024  # 4GB maximum file size
 MAX_WORKERS = 100  # Maximum threads for parallel processing
 BUFFER_SIZE = 20 * 1024 * 1024  # 20MB buffer for file operations
-CHUNK_SIZE = 1024 * 1024  # 1MB chunks for file reading
+CHUNK_SIZE = 1024 * 1024 * 20 # 1MB chunks for file reading
 MAX_CONCURRENT_TASKS = 5  # Maximum concurrent user tasks
 TIMEOUT_SECONDS = 3600  # 1 hour timeout for extraction/download
 
