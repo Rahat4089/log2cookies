@@ -26,7 +26,7 @@ import platform
 import signal
 import gc
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from typing import List, Set, Dict, Optional, Tuple, Any, Callable
 import threading
 from dataclasses import dataclass
@@ -2023,7 +2023,7 @@ class CookieExtractorBot:
                 
                 # Send completion message
                 elapsed = time.time() - task.start_time
-                await self.app.send_message(
+                completion_msg = await self.app.send_message(
                     chat_id=user_id,
                     text=f"""
 ╔════════════════════════════════════════╗
