@@ -23,9 +23,10 @@ import math
 import gc
 import urllib.parse
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
 import mimetypes
 import functools
+import queue
 
 # Pyrofork imports
 from pyrogram import Client, filters, enums
@@ -85,12 +86,13 @@ SEND_LOGS = True
 ADMINS = [7125341830]
 
 # ULTIMATE SPEED SETTINGS
-MAX_WORKERS = 50  # 50 threads for bot (reduced for stability)
-BUFFER_SIZE = 20 * 1024 * 1024  # 20MB buffer
-CHUNK_SIZE = 1024 * 1024  # 1MB chunks for file reading
-MAX_FILE_SIZE = 2000 * 1024 * 1024  # 2GB max file size
-DOWNLOAD_TIMEOUT = 300  # 5 minutes
-PROGRESS_UPDATE_INTERVAL = 2  # Update progress every 2 seconds
+MAX_WORKERS = 100  # Increased for maximum speed
+DOWNLOAD_WORKERS = 20  # Parallel download connections
+BUFFER_SIZE = 64 * 1024 * 1024  # 64MB buffer for faster I/O
+CHUNK_SIZE = 4 * 1024 * 1024  # 4MB chunks for faster downloading
+MAX_FILE_SIZE = 4000 * 1024 * 1024  # 4GB max file size
+DOWNLOAD_TIMEOUT = 600  # 10 minutes
+PROGRESS_UPDATE_INTERVAL = 1  # Update progress every second
 
 SUPPORTED_ARCHIVES = {'.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz'}
 COOKIE_FOLDERS = {'Cookies', 'Browsers'}
@@ -98,8 +100,9 @@ COOKIE_FOLDERS = {'Cookies', 'Browsers'}
 # Detect system
 SYSTEM = platform.system().lower()
 
-# Create global thread pool for CPU-bound tasks
+# Create global thread pools
 thread_pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+download_pool = ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS)
 
 # ==============================================================================
 #                            TOOL DETECTION
@@ -299,6 +302,7 @@ class ProgressTracker:
         self.current = 0
         self.description = description
         self.last_update = 0
+        self.last_update_amount = 0
         self.lock = asyncio.Lock()
         self.start_time = time.time()
         self.cancelled = False
@@ -308,7 +312,7 @@ class ProgressTracker:
         self.last_downloaded = 0
         self.speed_samples = []
         self.update_task = None
-        self.update_event = asyncio.Event()
+        self.update_queue = asyncio.Queue()
         
         # Register progress message
         if task_manager:
@@ -347,17 +351,19 @@ class ProgressTracker:
             self.current += amount
             current_time = time.time()
             
-            # Calculate speed
-            time_diff = current_time - self.last_update
-            if time_diff > 0 and self.last_update > 0:
-                speed = amount / time_diff  # bytes per second
-                self.speed_samples.append(speed)
-                # Keep last 5 samples for average
-                if len(self.speed_samples) > 5:
-                    self.speed_samples.pop(0)
+            # Calculate speed based on time difference and amount downloaded
+            if self.last_update > 0:
+                time_diff = current_time - self.last_update
+                if time_diff > 0:
+                    # Calculate speed for this interval
+                    interval_speed = amount / time_diff  # bytes per second
+                    self.speed_samples.append(interval_speed)
+                    # Keep last 5 samples for average
+                    if len(self.speed_samples) > 5:
+                        self.speed_samples.pop(0)
             
-            # Update if forced
-            if force:
+            # Update if forced or if enough time has passed
+            if force or current_time - self.last_update >= PROGRESS_UPDATE_INTERVAL:
                 await self._send_update()
                 self.last_update = current_time
                 self.last_downloaded = self.current
@@ -371,7 +377,20 @@ class ProgressTracker:
     def _calculate_speed(self) -> float:
         """Calculate average download speed"""
         if not self.speed_samples:
+            # If no samples, calculate based on total downloaded so far
+            elapsed = time.time() - self.start_time
+            if elapsed > 0 and self.current > 0:
+                return self.current / elapsed
             return 0
+        
+        # Calculate weighted average (more recent samples have higher weight)
+        weights = [0.5, 0.3, 0.1, 0.07, 0.03][:len(self.speed_samples)]
+        weighted_sum = sum(s * w for s, w in zip(self.speed_samples, weights))
+        total_weight = sum(weights)
+        
+        if total_weight > 0:
+            return weighted_sum / total_weight
+        
         return sum(self.speed_samples) / len(self.speed_samples)
     
     async def _send_update(self, force: bool = False):
@@ -382,6 +401,11 @@ class ProgressTracker:
             
             # Calculate speed
             speed = self._calculate_speed()
+            
+            # If speed is zero but we have downloaded something, calculate average speed
+            if speed == 0 and self.current > 0 and elapsed > 0:
+                speed = self.current / elapsed
+            
             speed_str = self._format_speed(speed)
             
             # Calculate ETA
@@ -475,6 +499,176 @@ class ProgressTracker:
             await self.message.edit_text(text, parse_mode=ParseMode.MARKDOWN)
         except:
             pass
+
+# ==============================================================================
+#                            DOWNLOAD MANAGER
+# ==============================================================================
+
+class DownloadManager:
+    """Manage parallel downloads for maximum speed"""
+    
+    def __init__(self):
+        self.session = None
+        self.download_tasks = {}
+        self.lock = asyncio.Lock()
+    
+    async def get_session(self):
+        """Get or create aiohttp session"""
+        if not self.session:
+            connector = aiohttp.TCPConnector(
+                limit=DOWNLOAD_WORKERS,
+                limit_per_host=DOWNLOAD_WORKERS,
+                ttl_dns_cache=300,
+                force_close=True,
+                enable_cleanup_closed=True
+            )
+            timeout = aiohttp.ClientTimeout(
+                total=DOWNLOAD_TIMEOUT,
+                connect=30,
+                sock_read=30
+            )
+            self.session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout,
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+            )
+        return self.session
+    
+    async def close(self):
+        """Close session"""
+        if self.session:
+            await self.session.close()
+            self.session = None
+    
+    async def download_file(self, url: str, file_path: str, progress: ProgressTracker, user_id: int) -> bool:
+        """Download file with maximum speed using parallel connections"""
+        try:
+            session = await self.get_session()
+            
+            # First, get file info
+            async with session.head(url, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    return False
+                
+                total_size = int(resp.headers.get('content-length', 0))
+                accept_ranges = resp.headers.get('accept-ranges', '').lower() == 'bytes'
+                
+                # Update progress total
+                await progress.set_total(total_size)
+            
+            if accept_ranges and total_size > CHUNK_SIZE * 2:
+                # Parallel download with multiple connections
+                return await self._parallel_download(url, file_path, total_size, progress, user_id)
+            else:
+                # Single connection download
+                return await self._single_download(url, file_path, progress, user_id)
+                
+        except Exception as e:
+            print(f"Download error: {e}")
+            return False
+    
+    async def _single_download(self, url: str, file_path: str, progress: ProgressTracker, user_id: int) -> bool:
+        """Single connection download"""
+        try:
+            session = await self.get_session()
+            
+            async with session.get(url, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    return False
+                
+                async with aiofiles.open(file_path, 'wb') as f:
+                    async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
+                        if await progress.task_manager.is_cancelled(user_id):
+                            return False
+                        
+                        await f.write(chunk)
+                        await progress.update(len(chunk))
+                
+                return True
+                
+        except Exception as e:
+            print(f"Single download error: {e}")
+            return False
+    
+    async def _parallel_download(self, url: str, file_path: str, total_size: int, progress: ProgressTracker, user_id: int) -> bool:
+        """Parallel download using multiple connections"""
+        try:
+            # Calculate chunk ranges
+            num_chunks = min(DOWNLOAD_WORKERS, (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE)
+            chunk_size = total_size // num_chunks
+            
+            ranges = []
+            for i in range(num_chunks):
+                start = i * chunk_size
+                end = start + chunk_size - 1 if i < num_chunks - 1 else total_size - 1
+                ranges.append((start, end))
+            
+            # Create temp files for each chunk
+            temp_files = []
+            download_tasks = []
+            
+            for i, (start, end) in enumerate(ranges):
+                temp_file = f"{file_path}.part{i}"
+                temp_files.append(temp_file)
+                
+                task = asyncio.create_task(
+                    self._download_chunk(url, temp_file, start, end, progress, user_id)
+                )
+                download_tasks.append(task)
+            
+            # Wait for all chunks to download
+            results = await asyncio.gather(*download_tasks, return_exceptions=True)
+            
+            # Check if any chunk failed
+            for result in results:
+                if isinstance(result, Exception) or result is False:
+                    return False
+            
+            # Merge chunks
+            async with aiofiles.open(file_path, 'wb') as outfile:
+                for temp_file in temp_files:
+                    async with aiofiles.open(temp_file, 'rb') as infile:
+                        while True:
+                            chunk = await infile.read(CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            await outfile.write(chunk)
+                    
+                    # Delete temp file
+                    os.remove(temp_file)
+            
+            return True
+            
+        except Exception as e:
+            print(f"Parallel download error: {e}")
+            return False
+    
+    async def _download_chunk(self, url: str, temp_file: str, start: int, end: int, progress: ProgressTracker, user_id: int) -> bool:
+        """Download a single chunk"""
+        try:
+            session = await self.get_session()
+            headers = {'Range': f'bytes={start}-{end}'}
+            
+            async with session.get(url, headers=headers, allow_redirects=True) as resp:
+                if resp.status not in (200, 206):
+                    return False
+                
+                async with aiofiles.open(temp_file, 'wb') as f:
+                    async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
+                        if await progress.task_manager.is_cancelled(user_id):
+                            return False
+                        
+                        await f.write(chunk)
+                        # Update progress for this chunk
+                        await progress.update(len(chunk))
+                
+                return True
+                
+        except Exception as e:
+            print(f"Chunk download error: {e}")
+            return False
 
 # ==============================================================================
 #                            UTILITY FUNCTIONS
@@ -955,12 +1149,11 @@ class UltimateArchiveExtractor:
                 new_archives = self.find_archives_fast(extract_subdir)
                 next_level.update(new_archives)
                 
-                # Update progress if available
+                # Update progress if available - use call_soon_threadsafe instead of coroutine
                 if self.progress:
-                    # Use asyncio.run_coroutine_threadsafe to update progress from thread
-                    asyncio.run_coroutine_threadsafe(
-                        self.progress.update(1),
-                        asyncio.get_event_loop()
+                    loop = asyncio.get_event_loop()
+                    loop.call_soon_threadsafe(
+                        lambda: asyncio.create_task(self.progress.update(1))
                     )
             
             current_level = next_level
@@ -1152,11 +1345,11 @@ class UltimateCookieExtractor:
             
             self.process_file(file_path, orig_name, extract_dir)
             
-            # Update progress if available
+            # Update progress if available - use call_soon_threadsafe
             if self.progress:
-                asyncio.run_coroutine_threadsafe(
-                    self.progress.update(1),
-                    asyncio.get_event_loop()
+                loop = asyncio.get_event_loop()
+                loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(self.progress.update(1))
                 )
     
     def create_site_zips(self, extract_dir: str, result_folder: str) -> Dict[str, str]:
@@ -1195,6 +1388,7 @@ class CookieExtractorBot:
             bot_token=BOT_TOKEN
         )
         self.task_manager = UserTaskManager()
+        self.download_manager = DownloadManager()
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
         self.downloads_dir = os.path.join(self.base_dir, 'downloads')
         self.results_dir = os.path.join(self.base_dir, 'results')
@@ -1227,6 +1421,9 @@ class CookieExtractorBot:
         # Cancel all active tasks
         for user_id, task in self.active_tasks.items():
             task.cancel()
+        
+        # Close download manager
+        await self.download_manager.close()
         
         await self.app.stop()
         print(f"{Fore.GREEN}Bot stopped{Style.RESET_ALL}")
@@ -1277,66 +1474,40 @@ class CookieExtractorBot:
     async def download_file(self, url: str, file_path: str, progress_msg: Message, task_id: str, filename: str) -> Tuple[bool, Optional[str]]:
         """Download file with progress and return success and detected archive type"""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT), allow_redirects=True) as resp:
-                    if resp.status != 200:
-                        await progress_msg.edit_text(f"❌ Download failed: HTTP {resp.status}")
-                        return False, None
-                    
-                    total_size = int(resp.headers.get('content-length', 0))
-                    if total_size > MAX_FILE_SIZE:
-                        await progress_msg.edit_text(f"❌ File too large: {format_size(total_size)} > {format_size(MAX_FILE_SIZE)}")
-                        return False, None
-                    
-                    # Try to get better filename from Content-Disposition
-                    content_disposition = resp.headers.get('Content-Disposition')
-                    if content_disposition:
-                        better_filename = get_filename_from_url(url, content_disposition)
-                        if better_filename != filename:
-                            filename = better_filename
-                            file_path = os.path.join(os.path.dirname(file_path), sanitize_filename(filename))
-                    
-                    # Create progress tracker with filename
-                    user_id = progress_msg.chat.id
-                    progress = ProgressTracker(progress_msg, total_size, "⬇️ Downloading", self.task_manager, filename)
-                    await progress.start_periodic_updates()
-                    
-                    downloaded = 0
-                    chunk_size = 1024 * 1024  # 1MB
-                    
-                    async with aiofiles.open(file_path, 'wb') as f:
-                        async for chunk in resp.content.iter_chunked(chunk_size):
-                            # Check cancellation
-                            if await self.task_manager.is_cancelled(user_id):
-                                await progress.cancel()
-                                return False, None
-                            
-                            await f.write(chunk)
-                            downloaded += len(chunk)
-                            await progress.update(len(chunk))
-                    
-                    await progress.stop_periodic_updates()
-                    
-                    # Detect archive type after download
-                    archive_type = await asyncio.get_event_loop().run_in_executor(
-                        thread_pool, detect_archive_type, file_path
-                    )
-                    
-                    if not archive_type:
-                        await progress_msg.edit_text("❌ Downloaded file is not a supported archive format.")
-                        return False, None
-                    
-                    # Rename file with correct extension if needed
-                    if not filename.lower().endswith(archive_type):
-                        new_filename = os.path.splitext(filename)[0] + archive_type
-                        new_file_path = os.path.join(os.path.dirname(file_path), sanitize_filename(new_filename))
-                        await asyncio.get_event_loop().run_in_executor(
-                            thread_pool, os.rename, file_path, new_file_path
-                        )
-                        file_path = new_file_path
-                        filename = new_filename
-                    
-                    return True, archive_type
+            # Create progress tracker with filename
+            user_id = progress_msg.chat.id
+            progress = ProgressTracker(progress_msg, 1, "⬇️ Downloading", self.task_manager, filename)
+            await progress.start_periodic_updates()
+            
+            # Download using download manager
+            success = await self.download_manager.download_file(url, file_path, progress, user_id)
+            
+            if not success or await self.task_manager.is_cancelled(user_id):
+                await progress.cancel()
+                return False, None
+            
+            await progress.stop_periodic_updates()
+            
+            # Detect archive type after download
+            archive_type = await asyncio.get_event_loop().run_in_executor(
+                thread_pool, detect_archive_type, file_path
+            )
+            
+            if not archive_type:
+                await progress_msg.edit_text("❌ Downloaded file is not a supported archive format.")
+                return False, None
+            
+            # Rename file with correct extension if needed
+            if not filename.lower().endswith(archive_type):
+                new_filename = os.path.splitext(filename)[0] + archive_type
+                new_file_path = os.path.join(os.path.dirname(file_path), sanitize_filename(new_filename))
+                await asyncio.get_event_loop().run_in_executor(
+                    thread_pool, os.rename, file_path, new_file_path
+                )
+                file_path = new_file_path
+                filename = new_filename
+            
+            return True, archive_type
                     
         except asyncio.CancelledError:
             return False, None
@@ -1719,7 +1890,7 @@ class CookieExtractorBot:
         task_id = generate_random_string(8)
         await self.task_manager.register_task(user_id, task_id, data)
         
-        # Send initial progress message - FIXED SYNTAX
+        # Send initial progress message
         progress_msg = await self.send_progress_message(
             user_id,
             f"🚀 **Starting process...**\n\n"
@@ -1882,7 +2053,7 @@ class CookieExtractorBot:
                 # Log to channel
                 log_text = (
                     f"✅ **Process Complete**\n"
-                    f"👤 User: `{user_id}`\n"
+                    f"👤 User: `{user_id}`\n
                     f"📦 File: `{data['filename']}`\n"
                     f"📁 Type: `{data.get('archive_type', 'Unknown')}`\n"
                     f"⏱️ Time: {format_time(elapsed)}\n"
