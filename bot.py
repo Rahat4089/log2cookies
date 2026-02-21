@@ -2053,7 +2053,7 @@ class CookieExtractorBot:
                 # Log to channel
                 log_text = (
                     f"✅ **Process Complete**\n"
-                    f"👤 User: `{user_id}`\n
+                    f"👤 User: `{user_id}`\n"
                     f"📦 File: `{data['filename']}`\n"
                     f"📁 Type: `{data.get('archive_type', 'Unknown')}`\n"
                     f"⏱️ Time: {format_time(elapsed)}\n"
