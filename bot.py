@@ -23,7 +23,7 @@ import math
 import gc
 import urllib.parse
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import mimetypes
 import functools
 
@@ -87,9 +87,9 @@ ADMINS = [7125341830]
 # ULTIMATE SPEED SETTINGS
 MAX_WORKERS = 50  # 50 threads for bot (reduced for stability)
 BUFFER_SIZE = 20 * 1024 * 1024  # 20MB buffer
-CHUNK_SIZE = 1024 * 1024 * 20 # 1MB chunks for file reading
-MAX_FILE_SIZE = 4000 * 1024 * 1024  # 2GB max file size
-DOWNLOAD_TIMEOUT = 3600  # 5 minutes
+CHUNK_SIZE = 1024 * 1024  # 1MB chunks for file reading
+MAX_FILE_SIZE = 2000 * 1024 * 1024  # 2GB max file size
+DOWNLOAD_TIMEOUT = 300  # 5 minutes
 PROGRESS_UPDATE_INTERVAL = 2  # Update progress every 2 seconds
 
 SUPPORTED_ARCHIVES = {'.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz'}
@@ -1366,9 +1366,9 @@ class CookieExtractorBot:
             # Download with progress callback
             async def progress_callback(current, total):
                 # Check cancellation
-                if asyncio.create_task(self.task_manager.is_cancelled(user_id)).result():
+                if await self.task_manager.is_cancelled(user_id):
                     raise asyncio.CancelledError()
-                asyncio.create_task(progress.update(current - progress.current))
+                await progress.update(current - progress.current)
             
             await message.download(file_name=file_path, progress=progress_callback)
             
@@ -1719,11 +1719,11 @@ class CookieExtractorBot:
         task_id = generate_random_string(8)
         await self.task_manager.register_task(user_id, task_id, data)
         
-        # Send initial progress message
+        # Send initial progress message - FIXED SYNTAX
         progress_msg = await self.send_progress_message(
             user_id,
-            "🚀 **Starting process...**\n\n"
-            f"📦 File: `{data['filename']}`\n
+            f"🚀 **Starting process...**\n\n"
+            f"📦 File: `{data['filename']}`\n"
             f"🔑 Password: {'Yes' if data['password'] else 'No'}\n"
             f"🎯 Domains: {', '.join(data['domains'])}\n\n"
             f"🔴 /cancel_{task_id} to cancel"
