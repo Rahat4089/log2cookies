@@ -22,6 +22,10 @@ from pathlib import Path
 import math
 import gc
 import urllib.parse
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
+import mimetypes
+import functools
 
 # Pyrofork imports
 from pyrogram import Client, filters, enums
@@ -83,15 +87,19 @@ ADMINS = [7125341830]
 # ULTIMATE SPEED SETTINGS
 MAX_WORKERS = 50  # 50 threads for bot (reduced for stability)
 BUFFER_SIZE = 20 * 1024 * 1024  # 20MB buffer
-CHUNK_SIZE = 1024 * 1024  # 1MB chunks for file reading
-MAX_FILE_SIZE = 2000 * 1024 * 1024  # 2GB max file size
-DOWNLOAD_TIMEOUT = 300  # 5 minutes
+CHUNK_SIZE = 1024 * 1024 * 20 # 1MB chunks for file reading
+MAX_FILE_SIZE = 4000 * 1024 * 1024  # 2GB max file size
+DOWNLOAD_TIMEOUT = 3600  # 5 minutes
+PROGRESS_UPDATE_INTERVAL = 2  # Update progress every 2 seconds
 
 SUPPORTED_ARCHIVES = {'.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz'}
 COOKIE_FOLDERS = {'Cookies', 'Browsers'}
 
 # Detect system
 SYSTEM = platform.system().lower()
+
+# Create global thread pool for CPU-bound tasks
+thread_pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 # ==============================================================================
 #                            TOOL DETECTION
@@ -230,6 +238,12 @@ class UserTaskManager:
         async with self.lock:
             return self.user_tasks.get(user_id)
     
+    async def get_task_id(self, user_id: int) -> Optional[str]:
+        """Get user task ID"""
+        async with self.lock:
+            task = self.user_tasks.get(user_id)
+            return task.get('task_id') if task else None
+    
     async def cancel_task(self, user_id: int, task_id: str = None) -> bool:
         """Cancel user task"""
         async with self.lock:
@@ -279,7 +293,7 @@ class UserTaskManager:
 class ProgressTracker:
     """Track and update progress messages"""
     
-    def __init__(self, message: Message, total: int, description: str = "Progress", task_manager: UserTaskManager = None):
+    def __init__(self, message: Message, total: int, description: str = "Progress", task_manager: UserTaskManager = None, filename: str = None):
         self.message = message
         self.total = total
         self.current = 0
@@ -290,10 +304,39 @@ class ProgressTracker:
         self.cancelled = False
         self.task_manager = task_manager
         self.user_id = message.chat.id
+        self.filename = filename
+        self.last_downloaded = 0
+        self.speed_samples = []
+        self.update_task = None
+        self.update_event = asyncio.Event()
         
         # Register progress message
         if task_manager:
             asyncio.create_task(task_manager.add_progress_message(self.user_id, message.id))
+    
+    async def start_periodic_updates(self):
+        """Start periodic updates"""
+        self.update_task = asyncio.create_task(self._periodic_update())
+    
+    async def stop_periodic_updates(self):
+        """Stop periodic updates"""
+        if self.update_task:
+            self.update_task.cancel()
+            try:
+                await self.update_task
+            except:
+                pass
+    
+    async def _periodic_update(self):
+        """Periodic update loop"""
+        try:
+            while not self.cancelled:
+                await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+                await self._send_update()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"Periodic update error: {e}")
     
     async def update(self, amount: int = 1, force: bool = False):
         """Update progress"""
@@ -304,10 +347,20 @@ class ProgressTracker:
             self.current += amount
             current_time = time.time()
             
-            # Update every 2 seconds or if forced
-            if force or current_time - self.last_update >= 2:
+            # Calculate speed
+            time_diff = current_time - self.last_update
+            if time_diff > 0 and self.last_update > 0:
+                speed = amount / time_diff  # bytes per second
+                self.speed_samples.append(speed)
+                # Keep last 5 samples for average
+                if len(self.speed_samples) > 5:
+                    self.speed_samples.pop(0)
+            
+            # Update if forced
+            if force:
                 await self._send_update()
                 self.last_update = current_time
+                self.last_downloaded = self.current
     
     async def set_total(self, total: int):
         """Set total value"""
@@ -315,15 +368,25 @@ class ProgressTracker:
             self.total = total
             await self._send_update(force=True)
     
+    def _calculate_speed(self) -> float:
+        """Calculate average download speed"""
+        if not self.speed_samples:
+            return 0
+        return sum(self.speed_samples) / len(self.speed_samples)
+    
     async def _send_update(self, force: bool = False):
         """Send progress update"""
         try:
             percentage = (self.current / self.total * 100) if self.total > 0 else 0
             elapsed = time.time() - self.start_time
             
+            # Calculate speed
+            speed = self._calculate_speed()
+            speed_str = self._format_speed(speed)
+            
             # Calculate ETA
-            if self.current > 0:
-                eta = (elapsed / self.current) * (self.total - self.current)
+            if speed > 0 and self.total > self.current:
+                eta = (self.total - self.current) / speed
                 eta_str = self._format_time(eta)
             else:
                 eta_str = "Calculating..."
@@ -337,14 +400,28 @@ class ProgressTracker:
             current_str = self._format_size(self.current)
             total_str = self._format_size(self.total)
             
-            text = (
-                f"**{self.description}**\n"
-                f"`{bar}` {percentage:.1f}%\n"
-                f"📊 {current_str} / {total_str}\n"
-                f"⏱️ ETA: {eta_str}\n"
-                f"⚡ Elapsed: {self._format_time(elapsed)}\n"
-                f"🔴 /cancel_{self.task_manager.user_tasks.get(self.user_id, {}).get('task_id', '') if self.task_manager else ''}"
-            )
+            # Get file extension
+            file_ext = os.path.splitext(self.filename)[1].upper() if self.filename else "UNKNOWN"
+            
+            # Build progress text
+            text_parts = [
+                f"**{self.description}**",
+                f"📄 **File:** `{self.filename or 'Unknown'}`",
+                f"📁 **Type:** `{file_ext}`",
+                f"`{bar}` {percentage:.1f}%",
+                f"📊 {current_str} / {total_str}",
+                f"⚡ **Speed:** {speed_str}",
+                f"⏱️ **ETA:** {eta_str}",
+                f"🕒 **Elapsed:** {self._format_time(elapsed)}"
+            ]
+            
+            # Add cancel button with task ID
+            if self.task_manager:
+                task_id = await self.task_manager.get_task_id(self.user_id)
+                if task_id:
+                    text_parts.append(f"🔴 /cancel_{task_id} to cancel")
+            
+            text = "\n".join(text_parts)
             
             await self.message.edit_text(text, parse_mode=ParseMode.MARKDOWN)
         except MessageNotModified:
@@ -360,18 +437,32 @@ class ProgressTracker:
             size_bytes /= 1024.0
         return f"{size_bytes:.1f}TB"
     
+    def _format_speed(self, speed_bytes: float) -> str:
+        """Format speed to human readable"""
+        if speed_bytes < 1024:
+            return f"{speed_bytes:.1f} B/s"
+        elif speed_bytes < 1024 * 1024:
+            return f"{speed_bytes/1024:.1f} KB/s"
+        elif speed_bytes < 1024 * 1024 * 1024:
+            return f"{speed_bytes/(1024*1024):.1f} MB/s"
+        else:
+            return f"{speed_bytes/(1024*1024*1024):.1f} GB/s"
+    
     def _format_time(self, seconds: float) -> str:
         """Format seconds to human readable"""
         if seconds < 60:
             return f"{seconds:.0f}s"
         elif seconds < 3600:
-            return f"{seconds/60:.1f}m"
+            minutes = seconds / 60
+            return f"{minutes:.1f}m"
         else:
-            return f"{seconds/3600:.1f}h"
+            hours = seconds / 3600
+            return f"{hours:.1f}h"
     
     async def cancel(self):
         """Cancel progress"""
         self.cancelled = True
+        await self.stop_periodic_updates()
         try:
             await self.message.edit_text("❌ **Task Cancelled**", parse_mode=ParseMode.MARKDOWN)
         except:
@@ -379,6 +470,7 @@ class ProgressTracker:
     
     async def complete(self, text: str):
         """Mark as complete"""
+        await self.stop_periodic_updates()
         try:
             await self.message.edit_text(text, parse_mode=ParseMode.MARKDOWN)
         except:
@@ -396,28 +488,86 @@ def generate_random_string(length: int = 6) -> str:
     """Generate random string for unique filenames"""
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
-def get_filename_from_url(url: str) -> str:
-    """Extract filename from URL"""
+def get_filename_from_url(url: str, content_disposition: str = None) -> str:
+    """Extract filename from URL or Content-Disposition header"""
+    # Try Content-Disposition first
+    if content_disposition:
+        filename_match = re.search(r'filename[^;=\n]*=(([\'"]).*?\2|[^;\n]*)', content_disposition, re.IGNORECASE)
+        if filename_match:
+            filename = filename_match.group(1).strip('"\'')
+            if filename:
+                return sanitize_filename(filename)
+    
+    # Fallback to URL path
     try:
-        # Parse URL
         parsed = urllib.parse.urlparse(url)
         path = parsed.path
-        
-        # Get filename from path
         filename = os.path.basename(path)
         
-        # If no filename, generate one
-        if not filename or filename == '/':
-            # Try to get from Content-Disposition later
-            return f"download_{generate_random_string(8)}.zip"
-        
-        # Remove query parameters
-        filename = filename.split('?')[0]
-        
-        # Sanitize
-        return sanitize_filename(filename)
+        if filename and filename != '/' and '.' in filename:
+            filename = filename.split('?')[0]
+            return sanitize_filename(filename)
     except:
-        return f"download_{generate_random_string(8)}.zip"
+        pass
+    
+    # Ultimate fallback
+    return f"download_{generate_random_string(8)}.bin"
+
+def detect_archive_type(file_path: str) -> Optional[str]:
+    """Detect archive type by reading file headers"""
+    try:
+        with open(file_path, 'rb') as f:
+            header = f.read(20)  # Read first 20 bytes for header detection
+            
+            # ZIP signature
+            if header.startswith(b'PK\x03\x04') or header.startswith(b'PK\x05\x06') or header.startswith(b'PK\x07\x08'):
+                return '.zip'
+            
+            # RAR signature
+            if header.startswith(b'Rar!\x1a\x07\x00') or header.startswith(b'Rar!\x1a\x07\x01'):
+                return '.rar'
+            
+            # 7Z signature
+            if header.startswith(b'7z\xbc\xaf\x27\x1c'):
+                return '.7z'
+            
+            # TAR signature
+            if header.startswith(b'ustar\x0000') or header.startswith(b'ustar  \x00'):
+                return '.tar'
+            
+            # GZ signature
+            if header.startswith(b'\x1f\x8b'):
+                return '.gz'
+            
+            # BZ2 signature
+            if header.startswith(b'BZh'):
+                return '.bz2'
+            
+            # XZ signature
+            if header.startswith(b'\xfd7zXZ\x00'):
+                return '.xz'
+            
+            # Try mimetypes as fallback
+            mime_type, _ = mimetypes.guess_type(file_path)
+            if mime_type:
+                if 'zip' in mime_type:
+                    return '.zip'
+                elif 'rar' in mime_type:
+                    return '.rar'
+                elif 'x-7z' in mime_type:
+                    return '.7z'
+                elif 'tar' in mime_type:
+                    return '.tar'
+                elif 'gzip' in mime_type:
+                    return '.gz'
+                elif 'bzip' in mime_type:
+                    return '.bz2'
+                elif 'xz' in mime_type:
+                    return '.xz'
+    except:
+        pass
+    
+    return None
 
 def get_file_hash_fast(filepath: str) -> str:
     """Fast file hash (first/last chunks only)"""
@@ -456,18 +606,20 @@ async def delete_entire_folder(folder_path: str) -> bool:
         # Force garbage collection to close any open handles
         gc.collect()
         
-        # Try multiple methods
+        # Run in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        
         if SYSTEM == 'windows':
-            os.system(f'rmdir /s /q "{folder_path}" 2>nul')
+            await loop.run_in_executor(thread_pool, lambda: os.system(f'rmdir /s /q "{folder_path}" 2>nul'))
         else:
-            os.system(f'rm -rf "{folder_path}"')
+            await loop.run_in_executor(thread_pool, lambda: os.system(f'rm -rf "{folder_path}"'))
         
         # Wait a bit
         await asyncio.sleep(1)
         
         # If still exists, try shutil
         if os.path.exists(folder_path):
-            shutil.rmtree(folder_path, ignore_errors=True)
+            await loop.run_in_executor(thread_pool, lambda: shutil.rmtree(folder_path, ignore_errors=True))
         
         return not os.path.exists(folder_path)
     except:
@@ -568,6 +720,7 @@ class UltimateArchiveExtractor:
         self.progress = None
         self.task_manager = None
         self.user_id = None
+        self.extraction_task = None
     
     def set_progress(self, progress, task_manager=None, user_id=None):
         """Set progress tracker"""
@@ -757,26 +910,31 @@ class UltimateArchiveExtractor:
     
     async def extract_all_nested(self, root_archive: str, base_dir: str) -> str:
         """Extract all nested archives"""
+        # Run extraction in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        self.extraction_task = asyncio.create_task(self._run_extraction(loop, root_archive, base_dir))
+        return await self.extraction_task
+    
+    async def _run_extraction(self, loop, root_archive: str, base_dir: str) -> str:
+        """Run extraction in thread pool"""
+        return await loop.run_in_executor(
+            thread_pool,
+            self._extract_all_nested_sync,
+            root_archive, base_dir
+        )
+    
+    def _extract_all_nested_sync(self, root_archive: str, base_dir: str) -> str:
+        """Synchronous version of extract_all_nested"""
         current_level = {root_archive}
         level = 0
         self.total_archives = 1
         
-        if self.progress:
-            await self.progress.set_total(self.total_archives)
-        
         while current_level and not self.stop_extraction:
-            # Check cancellation
-            if self.task_manager and self.user_id:
-                if await self.task_manager.is_cancelled(self.user_id):
-                    self.stop_extraction = True
-                    break
-            
             next_level = set()
             level_dir = os.path.join(base_dir, f"L{level}")
             os.makedirs(level_dir, exist_ok=True)
             
             # Process archives in this level
-            extract_tasks = []
             for archive in current_level:
                 if archive in self.processed_files or self.stop_extraction:
                     continue
@@ -786,42 +944,29 @@ class UltimateArchiveExtractor:
                 extract_subdir = os.path.join(level_dir, archive_name)
                 os.makedirs(extract_subdir, exist_ok=True)
                 
-                # Extract in thread pool (since extraction is CPU/IO bound)
-                loop = asyncio.get_event_loop()
-                task = loop.run_in_executor(
-                    None, 
-                    self._extract_and_find, 
-                    archive, extract_subdir
-                )
-                extract_tasks.append(task)
-            
-            # Wait for all extractions
-            if extract_tasks:
-                results = await asyncio.gather(*extract_tasks)
-                for new_archives in results:
-                    next_level.update(new_archives)
-                    if self.progress:
-                        await self.progress.update(1)
+                # Extract
+                self.extract_single(archive, extract_subdir)
+                
+                with self.lock:
+                    self.processed_files.add(archive)
+                    self.extracted_count += 1
+                
+                # Find new archives
+                new_archives = self.find_archives_fast(extract_subdir)
+                next_level.update(new_archives)
+                
+                # Update progress if available
+                if self.progress:
+                    # Use asyncio.run_coroutine_threadsafe to update progress from thread
+                    asyncio.run_coroutine_threadsafe(
+                        self.progress.update(1),
+                        asyncio.get_event_loop()
+                    )
             
             current_level = next_level
             level += 1
         
         return base_dir
-    
-    def _extract_and_find(self, archive: str, extract_dir: str) -> Set[str]:
-        """Extract and find new archives (runs in thread)"""
-        if self.stop_extraction:
-            return set()
-        
-        # Extract
-        self.extract_single(archive, extract_dir)
-        
-        with self.lock:
-            self.processed_files.add(archive)
-            self.extracted_count += 1
-        
-        # Find new archives
-        return set(self.find_archives_fast(extract_dir))
 
 # ==============================================================================
 #                            COOKIE EXTRACTION
@@ -846,6 +991,7 @@ class UltimateCookieExtractor:
         self.progress = None
         self.task_manager = None
         self.user_id = None
+        self.processing_task = None
         
         # Pre-compile patterns for each site
         self.site_patterns = {site: re.compile(re.escape(site).encode()) for site in self.target_sites}
@@ -949,7 +1095,6 @@ class UltimateCookieExtractor:
                                     self.total_found += 1
             
             # Save SEPARATE file for EACH site that had matches
-            files_saved = 0
             for site, matches in site_matches.items():
                 if matches:
                     # Sort by line number to maintain original order
@@ -968,8 +1113,6 @@ class UltimateCookieExtractor:
                     
                     with self.seen_lock:
                         self.site_files[site][out_path] = unique_name
-                    
-                    files_saved += 1
             
             with self.stats_lock:
                 self.files_processed += 1
@@ -979,42 +1122,42 @@ class UltimateCookieExtractor:
     
     async def process_all(self, extract_dir: str):
         """Process all files"""
+        # Run processing in thread pool
+        loop = asyncio.get_event_loop()
+        self.processing_task = asyncio.create_task(
+            self._run_processing(loop, extract_dir)
+        )
+        return await self.processing_task
+    
+    async def _run_processing(self, loop, extract_dir: str):
+        """Run processing in thread pool"""
+        return await loop.run_in_executor(
+            thread_pool,
+            self._process_all_sync,
+            extract_dir
+        )
+    
+    def _process_all_sync(self, extract_dir: str):
+        """Synchronous version of process_all"""
         # Find all cookie files
         cookie_files = self.find_cookie_files(extract_dir)
         
         if not cookie_files:
             return
         
-        if self.progress:
-            await self.progress.set_total(len(cookie_files))
-        
-        # Process files in thread pool
-        loop = asyncio.get_event_loop()
-        tasks = []
-        
+        # Process files
         for file_path, orig_name in cookie_files:
-            # Check cancellation
-            if self.task_manager and self.user_id:
-                if await self.task_manager.is_cancelled(self.user_id):
-                    self.stop_processing = True
-                    break
-            
             if self.stop_processing:
                 break
             
-            task = loop.run_in_executor(
-                None,
-                self.process_file,
-                file_path, orig_name, extract_dir
-            )
-            tasks.append(task)
-        
-        # Wait for all tasks
-        if tasks:
-            for i, task in enumerate(asyncio.as_completed(tasks)):
-                await task
-                if self.progress and not self.stop_processing:
-                    await self.progress.update(1)
+            self.process_file(file_path, orig_name, extract_dir)
+            
+            # Update progress if available
+            if self.progress:
+                asyncio.run_coroutine_threadsafe(
+                    self.progress.update(1),
+                    asyncio.get_event_loop()
+                )
     
     def create_site_zips(self, extract_dir: str, result_folder: str) -> Dict[str, str]:
         """Create ZIP archives per site"""
@@ -1066,6 +1209,7 @@ class CookieExtractorBot:
         self.user_states = {}
         self.user_data = {}
         self.state_lock = asyncio.Lock()
+        self.active_tasks = {}
         
     async def start(self):
         """Start the bot"""
@@ -1079,6 +1223,11 @@ class CookieExtractorBot:
     async def stop(self):
         """Stop the bot"""
         print(f"{Fore.YELLOW}Stopping bot...{Style.RESET_ALL}")
+        
+        # Cancel all active tasks
+        for user_id, task in self.active_tasks.items():
+            task.cancel()
+        
         await self.app.stop()
         print(f"{Fore.GREEN}Bot stopped{Style.RESET_ALL}")
     
@@ -1100,7 +1249,7 @@ class CookieExtractorBot:
                                         os.remove(item_path)
                                 elif os.path.isdir(item_path):
                                     if current_time - os.path.getmtime(item_path) > 3600:
-                                        shutil.rmtree(item_path, ignore_errors=True)
+                                        await delete_entire_folder(item_path)
                             except:
                                 pass
                 
@@ -1125,23 +1274,32 @@ class CookieExtractorBot:
         msg = await self.app.send_message(user_id, text, parse_mode=ParseMode.MARKDOWN)
         return msg
     
-    async def download_file(self, url: str, file_path: str, progress_msg: Message, task_id: str) -> bool:
-        """Download file with progress"""
+    async def download_file(self, url: str, file_path: str, progress_msg: Message, task_id: str, filename: str) -> Tuple[bool, Optional[str]]:
+        """Download file with progress and return success and detected archive type"""
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT), allow_redirects=True) as resp:
                     if resp.status != 200:
                         await progress_msg.edit_text(f"❌ Download failed: HTTP {resp.status}")
-                        return False
+                        return False, None
                     
                     total_size = int(resp.headers.get('content-length', 0))
                     if total_size > MAX_FILE_SIZE:
                         await progress_msg.edit_text(f"❌ File too large: {format_size(total_size)} > {format_size(MAX_FILE_SIZE)}")
-                        return False
+                        return False, None
                     
-                    # Create progress tracker
+                    # Try to get better filename from Content-Disposition
+                    content_disposition = resp.headers.get('Content-Disposition')
+                    if content_disposition:
+                        better_filename = get_filename_from_url(url, content_disposition)
+                        if better_filename != filename:
+                            filename = better_filename
+                            file_path = os.path.join(os.path.dirname(file_path), sanitize_filename(filename))
+                    
+                    # Create progress tracker with filename
                     user_id = progress_msg.chat.id
-                    progress = ProgressTracker(progress_msg, total_size, "⬇️ Downloading", self.task_manager)
+                    progress = ProgressTracker(progress_msg, total_size, "⬇️ Downloading", self.task_manager, filename)
+                    await progress.start_periodic_updates()
                     
                     downloaded = 0
                     chunk_size = 1024 * 1024  # 1MB
@@ -1150,22 +1308,44 @@ class CookieExtractorBot:
                         async for chunk in resp.content.iter_chunked(chunk_size):
                             # Check cancellation
                             if await self.task_manager.is_cancelled(user_id):
-                                return False
+                                await progress.cancel()
+                                return False, None
                             
                             await f.write(chunk)
                             downloaded += len(chunk)
                             await progress.update(len(chunk))
                     
-                    return True
+                    await progress.stop_periodic_updates()
+                    
+                    # Detect archive type after download
+                    archive_type = await asyncio.get_event_loop().run_in_executor(
+                        thread_pool, detect_archive_type, file_path
+                    )
+                    
+                    if not archive_type:
+                        await progress_msg.edit_text("❌ Downloaded file is not a supported archive format.")
+                        return False, None
+                    
+                    # Rename file with correct extension if needed
+                    if not filename.lower().endswith(archive_type):
+                        new_filename = os.path.splitext(filename)[0] + archive_type
+                        new_file_path = os.path.join(os.path.dirname(file_path), sanitize_filename(new_filename))
+                        await asyncio.get_event_loop().run_in_executor(
+                            thread_pool, os.rename, file_path, new_file_path
+                        )
+                        file_path = new_file_path
+                        filename = new_filename
+                    
+                    return True, archive_type
                     
         except asyncio.CancelledError:
-            return False
+            return False, None
         except Exception as e:
             await progress_msg.edit_text(f"❌ Download error: {str(e)}")
-            return False
+            return False, None
     
-    async def download_telegram_file(self, message: Message, file_path: str, progress_msg: Message, task_id: str) -> bool:
-        """Download file from Telegram with progress"""
+    async def download_telegram_file(self, message: Message, file_path: str, progress_msg: Message, task_id: str, filename: str) -> Tuple[bool, Optional[str]]:
+        """Download file from Telegram with progress and return success and detected archive type"""
         try:
             # Get file size
             file_size = 0
@@ -1176,28 +1356,50 @@ class CookieExtractorBot:
             
             if file_size > MAX_FILE_SIZE:
                 await progress_msg.edit_text(f"❌ File too large: {format_size(file_size)} > {format_size(MAX_FILE_SIZE)}")
-                return False
+                return False, None
             
-            # Create progress tracker
+            # Create progress tracker with filename
             user_id = progress_msg.chat.id
-            progress = ProgressTracker(progress_msg, file_size, "⬇️ Downloading", self.task_manager)
+            progress = ProgressTracker(progress_msg, file_size, "⬇️ Downloading", self.task_manager, filename)
+            await progress.start_periodic_updates()
             
             # Download with progress callback
             async def progress_callback(current, total):
                 # Check cancellation
-                if await self.task_manager.is_cancelled(user_id):
+                if asyncio.create_task(self.task_manager.is_cancelled(user_id)).result():
                     raise asyncio.CancelledError()
-                await progress.update(current - progress.current)
+                asyncio.create_task(progress.update(current - progress.current))
             
             await message.download(file_name=file_path, progress=progress_callback)
             
-            return True
+            await progress.stop_periodic_updates()
+            
+            # Detect archive type after download
+            archive_type = await asyncio.get_event_loop().run_in_executor(
+                thread_pool, detect_archive_type, file_path
+            )
+            
+            if not archive_type:
+                await progress_msg.edit_text("❌ Downloaded file is not a supported archive format.")
+                return False, None
+            
+            # Rename file with correct extension if needed
+            if not filename.lower().endswith(archive_type):
+                new_filename = os.path.splitext(filename)[0] + archive_type
+                new_file_path = os.path.join(os.path.dirname(file_path), sanitize_filename(new_filename))
+                await asyncio.get_event_loop().run_in_executor(
+                    thread_pool, os.rename, file_path, new_file_path
+                )
+                file_path = new_file_path
+                filename = new_filename
+            
+            return True, archive_type
             
         except asyncio.CancelledError:
-            return False
+            return False, None
         except Exception as e:
             await progress_msg.edit_text(f"❌ Download error: {str(e)}")
-            return False
+            return False, None
     
     # ==========================================================================
     #                            HANDLERS
@@ -1247,6 +1449,11 @@ class CookieExtractorBot:
                     await delete_entire_folder(task['data']['download_folder'])
                 if 'extract_folder' in task['data']:
                     await delete_entire_folder(task['data']['extract_folder'])
+                
+                # Cancel active task
+                if user_id in self.active_tasks:
+                    self.active_tasks[user_id].cancel()
+                    del self.active_tasks[user_id]
             else:
                 await message.reply_text("❌ Invalid task ID or no active task.")
         else:
@@ -1255,6 +1462,17 @@ class CookieExtractorBot:
             if task:
                 await self.task_manager.cancel_task(user_id)
                 await message.reply_text("✅ **Task cancelled successfully!**")
+                
+                # Clean up user files
+                if 'download_folder' in task['data']:
+                    await delete_entire_folder(task['data']['download_folder'])
+                if 'extract_folder' in task['data']:
+                    await delete_entire_folder(task['data']['extract_folder'])
+                
+                # Cancel active task
+                if user_id in self.active_tasks:
+                    self.active_tasks[user_id].cancel()
+                    del self.active_tasks[user_id]
             else:
                 await message.reply_text("❌ No active task found.")
     
@@ -1291,27 +1509,21 @@ class CookieExtractorBot:
             )
             return
         
-        # Check file extension
+        # Check file extension (preliminary check)
         if not message.document:
             return
         
         file_name = message.document.file_name
         ext = os.path.splitext(file_name)[1].lower()
         
-        if ext not in SUPPORTED_ARCHIVES:
-            await message.reply_text(
-                f"❌ Unsupported file type: {ext}\n"
-                f"Supported: {', '.join(SUPPORTED_ARCHIVES)}"
-            )
-            return
-        
-        # Store file info
+        # Store file info (we'll verify after download)
         async with self.state_lock:
             self.user_data[user_id] = {
                 'type': 'telegram',
                 'message': message,
                 'filename': file_name,
-                'file_size': message.document.file_size
+                'file_size': message.document.file_size,
+                'extension': ext
             }
             self.user_states[user_id] = 'awaiting_password'
         
@@ -1347,7 +1559,7 @@ class CookieExtractorBot:
                 )
                 return
             
-            # Store URL info
+            # Store URL info (we'll detect type after download)
             filename = get_filename_from_url(text)
             async with self.state_lock:
                 self.user_data[user_id] = {
@@ -1367,7 +1579,8 @@ class CookieExtractorBot:
             ])
             
             await message.reply_text(
-                f"📦 **URL received:** `{filename}`\n\n"
+                f"📦 **URL received:** `{filename}`\n"
+                f"🔍 **Note:** Archive type will be detected after download\n\n"
                 f"🔒 Is this archive password protected?",
                 reply_markup=keyboard
             )
@@ -1431,7 +1644,8 @@ class CookieExtractorBot:
                 "📖 **User Guide**\n\n"
                 "1️⃣ **Send Archive**\n"
                 "   • Upload file directly or provide any direct download link\n"
-                "   • Supported: .zip, .rar, .7z, .tar, .gz\n\n"
+                "   • Archive type detected automatically after download\n"
+                "   • Supported: .zip, .rar, .7z, .tar, .gz, .bz2, .xz\n\n"
                 "2️⃣ **Password (if needed)**\n"
                 "   • Tell me if it's password protected\n"
                 "   • Send the password if yes\n\n"
@@ -1509,12 +1723,29 @@ class CookieExtractorBot:
         progress_msg = await self.send_progress_message(
             user_id,
             "🚀 **Starting process...**\n\n"
-            f"📦 File: `{data['filename']}`\n"
+            f"📦 File: `{data['filename']}`\n
             f"🔑 Password: {'Yes' if data['password'] else 'No'}\n"
             f"🎯 Domains: {', '.join(data['domains'])}\n\n"
             f"🔴 /cancel_{task_id} to cancel"
         )
         
+        # Create processing task
+        processing_task = asyncio.create_task(
+            self._process_user_task(user_id, data, progress_msg, task_id)
+        )
+        self.active_tasks[user_id] = processing_task
+        
+        try:
+            await processing_task
+        except asyncio.CancelledError:
+            await progress_msg.edit_text("❌ **Task cancelled by user**")
+        finally:
+            if user_id in self.active_tasks:
+                del self.active_tasks[user_id]
+            await self.task_manager.clear_task(user_id)
+    
+    async def _process_user_task(self, user_id: int, data: Dict, progress_msg: Message, task_id: str):
+        """Process user task (separate coroutine)"""
         try:
             # Create unique folders
             unique_id = datetime.now().strftime('%H%M%S_') + generate_random_string(4)
@@ -1533,26 +1764,39 @@ class CookieExtractorBot:
             # Step 1: Download file
             file_path = os.path.join(download_folder, sanitize_filename(data['filename']))
             
+            archive_type = None
             if data['type'] == 'telegram':
-                success = await self.download_telegram_file(data['message'], file_path, progress_msg, task_id)
+                success, archive_type = await self.download_telegram_file(data['message'], file_path, progress_msg, task_id, data['filename'])
             else:  # URL
-                success = await self.download_file(data['url'], file_path, progress_msg, task_id)
+                success, archive_type = await self.download_file(data['url'], file_path, progress_msg, task_id, data['filename'])
             
             if not success or await self.task_manager.is_cancelled(user_id):
                 await self.cleanup_user_files(user_id, download_folder, extract_folder)
                 return
             
+            # Update filename if changed
+            if archive_type:
+                data['archive_type'] = archive_type
+                if not data['filename'].lower().endswith(archive_type):
+                    data['filename'] = os.path.splitext(data['filename'])[0] + archive_type
+            
             # Step 2: Extract archives
             await progress_msg.edit_text(
-                f"📦 **Extracting archives...**\n\n"
+                f"📦 **Extracting archives...**\n"
+                f"📄 File: `{data['filename']}`\n"
+                f"📁 Type: `{archive_type.upper() if archive_type else 'Unknown'}`\n\n"
                 f"🔴 /cancel_{task_id} to cancel"
             )
             
-            extract_progress = ProgressTracker(progress_msg, 1, "📦 Extracting", self.task_manager)
+            extract_progress = ProgressTracker(progress_msg, 1, "📦 Extracting", self.task_manager, data['filename'])
+            await extract_progress.start_periodic_updates()
+            
             extractor = UltimateArchiveExtractor(data['password'])
             extractor.set_progress(extract_progress, self.task_manager, user_id)
             
             await extractor.extract_all_nested(file_path, extract_folder)
+            
+            await extract_progress.stop_periodic_updates()
             
             if await self.task_manager.is_cancelled(user_id):
                 await self.cleanup_user_files(user_id, download_folder, extract_folder)
@@ -1560,15 +1804,20 @@ class CookieExtractorBot:
             
             # Step 3: Filter cookies
             await progress_msg.edit_text(
-                f"🔍 **Filtering cookies...**\n\n"
+                f"🔍 **Filtering cookies...**\n"
+                f"🎯 Domains: {', '.join(data['domains'])}\n\n"
                 f"🔴 /cancel_{task_id} to cancel"
             )
             
-            cookie_progress = ProgressTracker(progress_msg, 1, "🔍 Filtering", self.task_manager)
+            cookie_progress = ProgressTracker(progress_msg, 1, "🔍 Filtering", self.task_manager, data['filename'])
+            await cookie_progress.start_periodic_updates()
+            
             cookie_extractor = UltimateCookieExtractor(data['domains'])
             cookie_extractor.set_progress(cookie_progress, self.task_manager, user_id)
             
             await cookie_extractor.process_all(extract_folder)
+            
+            await cookie_progress.stop_periodic_updates()
             
             if await self.task_manager.is_cancelled(user_id):
                 await self.cleanup_user_files(user_id, download_folder, extract_folder)
@@ -1580,7 +1829,13 @@ class CookieExtractorBot:
                 f"🔴 /cancel_{task_id} to cancel"
             )
             
-            created_zips = cookie_extractor.create_site_zips(extract_folder, result_folder)
+            # Run ZIP creation in thread pool
+            loop = asyncio.get_event_loop()
+            created_zips = await loop.run_in_executor(
+                thread_pool,
+                cookie_extractor.create_site_zips,
+                extract_folder, result_folder
+            )
             
             if await self.task_manager.is_cancelled(user_id):
                 await self.cleanup_user_files(user_id, download_folder, extract_folder)
@@ -1629,6 +1884,7 @@ class CookieExtractorBot:
                     f"✅ **Process Complete**\n"
                     f"👤 User: `{user_id}`\n"
                     f"📦 File: `{data['filename']}`\n"
+                    f"📁 Type: `{data.get('archive_type', 'Unknown')}`\n"
                     f"⏱️ Time: {format_time(elapsed)}\n"
                     f"🔍 Entries: {cookie_extractor.total_found}\n"
                     f"📁 Zips: {len(created_zips)}"
@@ -1645,11 +1901,12 @@ class CookieExtractorBot:
             await self.cleanup_user_files(user_id, download_folder, extract_folder)
             
         except asyncio.CancelledError:
-            await progress_msg.edit_text("❌ **Task cancelled by user**")
-            await self.cleanup_user_files(user_id, download_folder, extract_folder)
+            raise
         except Exception as e:
             await progress_msg.edit_text(f"❌ **Error:** {str(e)}")
             await self.log_to_channel(f"❌ Error for user {user_id}: {str(e)}")
+            import traceback
+            traceback.print_exc()
             await self.cleanup_user_files(user_id, download_folder, extract_folder)
         finally:
             # Clear user data
@@ -1658,7 +1915,6 @@ class CookieExtractorBot:
                     del self.user_data[user_id]
                 if user_id in self.user_states:
                     del self.user_states[user_id]
-            await self.task_manager.clear_task(user_id)
     
     async def cleanup_user_files(self, user_id: int, *folders):
         """Clean up user files"""
