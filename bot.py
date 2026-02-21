@@ -21,9 +21,6 @@ import math
 import traceback
 from pathlib import Path
 import uuid
-import mimetypes
-from urllib.parse import urlparse
-import functools
 
 # Third-party imports
 try:
@@ -86,23 +83,8 @@ ADMINS = [7125341830]
 MAX_WORKERS = 100  # 100 threads for maximum speed
 BUFFER_SIZE = 20 * 1024 * 1024  # 20MB buffer
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks for file reading
-SUPPORTED_ARCHIVES = {'.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.tgz', '.tbz2'}
+SUPPORTED_ARCHIVES = {'.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz'}
 COOKIE_FOLDERS = {'Cookies', 'Browsers'}
-
-# Archive signatures (magic bytes)
-ARCHIVE_SIGNATURES = {
-    b'PK\x03\x04': 'zip',
-    b'PK\x05\x06': 'zip',
-    b'PK\x07\x08': 'zip',
-    b'Rar!\x1a\x07': 'rar',
-    b'Rar!\x1a\x07\x00': 'rar',
-    b'7z\xbc\xaf\x27\x1c': '7z',
-    b'\x1f\x8b': 'gz',
-    b'\x42\x5a\x68': 'bz2',
-    b'\xfd\x37\x7a\x58\x5a\x00': 'xz',
-    b'\x75\x73\x74\x61\x72': 'tar',
-    b'\x75\x73\x74\x61\x72\x20': 'tar',
-}
 
 # Progress update interval (seconds)
 PROGRESS_UPDATE_INTERVAL = 5
@@ -243,54 +225,6 @@ def get_file_hash_fast(filepath: str) -> str:
     except:
         return str(os.path.getmtime(filepath))
 
-def detect_file_type_from_content(file_path: str) -> Optional[str]:
-    """Detect file type by reading magic bytes"""
-    try:
-        with open(file_path, 'rb') as f:
-            header = f.read(1024)
-        
-        # Check against known signatures
-        for signature, file_type in ARCHIVE_SIGNATURES.items():
-            if header.startswith(signature):
-                return file_type
-        
-        # Check for tar variants
-        if header[257:262] in [b'ustar', b'ustar\x00']:
-            return 'tar'
-        
-        return None
-    except:
-        return None
-
-def detect_file_type_from_url(url: str) -> Optional[str]:
-    """Detect file type from URL extension or content-type"""
-    # Try to get extension from URL
-    parsed = urlparse(url)
-    path = parsed.path.lower()
-    
-    # Check common extensions
-    for ext in SUPPORTED_ARCHIVES:
-        if path.endswith(ext):
-            return ext[1:]  # Remove the dot
-    
-    # Try to guess from query parameters
-    if '.zip' in path or 'zip' in url:
-        return 'zip'
-    elif '.rar' in path or 'rar' in url:
-        return 'rar'
-    elif '.7z' in path or '7z' in url:
-        return '7z'
-    elif '.tar' in path or 'tar' in url:
-        return 'tar'
-    elif '.gz' in path or 'gz' in url:
-        return 'gz'
-    elif '.bz2' in path or 'bz2' in url:
-        return 'bz2'
-    elif '.xz' in path or 'xz' in url:
-        return 'xz'
-    
-    return None
-
 def format_size(size_bytes: int) -> str:
     """Quick size formatting"""
     for unit in ['B', 'KB', 'MB', 'GB']:
@@ -394,14 +328,6 @@ Traceback:
     
     return log_file
 
-def run_in_executor(func):
-    """Decorator to run blocking functions in executor"""
-    @functools.wraps(func)
-    async def wrapper(*args, **kwargs):
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
-    return wrapper
-
 # ==============================================================================
 # PASSWORD DETECTION
 # ==============================================================================
@@ -478,29 +404,6 @@ class PasswordDetector:
                 return False
         except:
             return True
-    
-    @staticmethod
-    async def check_protection(archive_path: str) -> Tuple[bool, Optional[str]]:
-        """Check if archive is password protected and detect its type"""
-        ext = os.path.splitext(archive_path)[1].lower()
-        
-        # Also detect by content
-        file_type = await run_in_executor(detect_file_type_from_content)(archive_path)
-        if file_type and file_type not in ext:
-            ext = f'.{file_type}'
-        
-        try:
-            if ext == '.rar' or file_type == 'rar':
-                return await run_in_executor(PasswordDetector.check_rar_protected)(archive_path), 'rar'
-            elif ext == '.7z' or file_type == '7z':
-                return await run_in_executor(PasswordDetector.check_7z_protected)(archive_path), '7z'
-            elif ext in ['.zip', '.jar', '.epub'] or file_type == 'zip':
-                return await run_in_executor(PasswordDetector.check_zip_protected)(archive_path), 'zip'
-            else:
-                # For other formats, assume not protected
-                return False, ext[1:] if ext else file_type
-        except:
-            return True, ext[1:] if ext else 'unknown'
 
 # ==============================================================================
 # ARCHIVE EXTRACTION - OPTIMIZED PER TYPE
@@ -518,7 +421,6 @@ class UltimateArchiveExtractor:
         self.current_level = 0
         self.progress_callback = None
         self.error_callback = None
-        self.last_progress_time = 0
     
     def set_progress_callback(self, callback):
         """Set progress callback"""
@@ -528,7 +430,6 @@ class UltimateArchiveExtractor:
         """Set error callback"""
         self.error_callback = callback
     
-    @run_in_executor
     def extract_7z_with_7z(self, archive_path: str, extract_dir: str) -> Tuple[List[str], Optional[str]]:
         """Extract .7z using 7z.exe (best for 7z)"""
         try:
@@ -553,7 +454,6 @@ class UltimateArchiveExtractor:
         except Exception as e:
             return [], str(e)
     
-    @run_in_executor
     def extract_rar_with_unrar(self, archive_path: str, extract_dir: str) -> Tuple[List[str], Optional[str]]:
         """Extract .rar using UnRAR.exe (best for RAR)"""
         try:
@@ -580,7 +480,6 @@ class UltimateArchiveExtractor:
         except Exception as e:
             return [], str(e)
     
-    @run_in_executor
     def extract_zip_fastest(self, archive_path: str, extract_dir: str) -> Tuple[List[str], Optional[str]]:
         """Extract .zip using fastest available method"""
         # Priority: 7z.exe > unrar.exe > Python zipfile
@@ -641,7 +540,6 @@ class UltimateArchiveExtractor:
         except Exception as e:
             return [], str(e)
     
-    @run_in_executor
     def extract_rar_fallback(self, archive_path: str, extract_dir: str) -> Tuple[List[str], Optional[str]]:
         """Fallback RAR extraction using rarfile"""
         try:
@@ -655,7 +553,6 @@ class UltimateArchiveExtractor:
         except Exception as e:
             return [], str(e)
     
-    @run_in_executor
     def extract_7z_fallback(self, archive_path: str, extract_dir: str) -> Tuple[List[str], Optional[str]]:
         """Fallback 7z extraction using py7zr"""
         try:
@@ -669,99 +566,43 @@ class UltimateArchiveExtractor:
         except Exception as e:
             return [], str(e)
     
-    @run_in_executor
     def extract_tar_fast(self, archive_path: str, extract_dir: str) -> Tuple[List[str], Optional[str]]:
         """Extract TAR/GZ/BZ2"""
         try:
             import tarfile
-            mode = 'r:*'
-            with tarfile.open(archive_path, mode) as tf:
+            with tarfile.open(archive_path, 'r:*') as tf:
                 tf.extractall(extract_dir)
                 return tf.getnames(), None
         except Exception as e:
             return [], str(e)
     
-    @run_in_executor
     def extract_single(self, archive_path: str, extract_dir: str) -> Tuple[List[str], Optional[str]]:
         """Extract a single archive using best tool for its type"""
         if self.stop_extraction:
             return [], "Cancelled"
         
-        # Detect file type by content first
-        file_type = detect_file_type_from_content(archive_path)
         ext = os.path.splitext(archive_path)[1].lower()
         
         try:
             # .7z files -> use 7z.exe
-            if file_type == '7z' or ext == '.7z':
+            if ext == '.7z':
                 if TOOL_STATUS['7z']:
                     return self.extract_7z_with_7z(archive_path, extract_dir)
                 elif HAS_PY7ZR:
                     return self.extract_7z_fallback(archive_path, extract_dir)
             
             # .rar files -> use UnRAR.exe
-            elif file_type == 'rar' or ext == '.rar':
+            elif ext == '.rar':
                 if TOOL_STATUS['unrar']:
                     return self.extract_rar_with_unrar(archive_path, extract_dir)
                 elif HAS_RARFILE:
                     return self.extract_rar_fallback(archive_path, extract_dir)
             
-            # .zip files -> use fastest available
-            elif file_type == 'zip' or ext == '.zip':
+            # .zip files -> use fastest available (7z.exe > unrar.exe > Python)
+            elif ext == '.zip':
                 return self.extract_zip_fastest(archive_path, extract_dir)
             
-            # GZIP files
-            elif file_type == 'gz' or ext == '.gz':
-                # Check if it's actually a tar.gz
-                if archive_path.endswith('.tar.gz') or archive_path.endswith('.tgz'):
-                    return self.extract_tar_fast(archive_path, extract_dir)
-                else:
-                    # Just a gzip file, extract to same name without .gz
-                    try:
-                        import gzip
-                        output_path = os.path.join(extract_dir, os.path.basename(archive_path)[:-3])
-                        with gzip.open(archive_path, 'rb') as f_in:
-                            with open(output_path, 'wb') as f_out:
-                                shutil.copyfileobj(f_in, f_out)
-                        return [os.path.basename(output_path)], None
-                    except Exception as e:
-                        return [], str(e)
-            
-            # BZIP2 files
-            elif file_type == 'bz2' or ext == '.bz2':
-                if archive_path.endswith('.tar.bz2') or archive_path.endswith('.tbz2'):
-                    return self.extract_tar_fast(archive_path, extract_dir)
-                else:
-                    try:
-                        import bz2
-                        output_path = os.path.join(extract_dir, os.path.basename(archive_path)[:-4])
-                        with bz2.open(archive_path, 'rb') as f_in:
-                            with open(output_path, 'wb') as f_out:
-                                shutil.copyfileobj(f_in, f_out)
-                        return [os.path.basename(output_path)], None
-                    except Exception as e:
-                        return [], str(e)
-            
-            # XZ files
-            elif file_type == 'xz' or ext == '.xz':
-                if archive_path.endswith('.tar.xz'):
-                    return self.extract_tar_fast(archive_path, extract_dir)
-                else:
-                    try:
-                        import lzma
-                        output_path = os.path.join(extract_dir, os.path.basename(archive_path)[:-3])
-                        with lzma.open(archive_path, 'rb') as f_in:
-                            with open(output_path, 'wb') as f_out:
-                                shutil.copyfileobj(f_in, f_out)
-                        return [os.path.basename(output_path)], None
-                    except Exception as e:
-                        return [], str(e)
-            
-            # TAR files
-            elif file_type == 'tar' or ext in ['.tar', '.tgz', '.tbz2']:
-                return self.extract_tar_fast(archive_path, extract_dir)
-            
-            # Unknown format, try tar as fallback
+            # Other formats (tar, gz, etc.)
             else:
                 return self.extract_tar_fast(archive_path, extract_dir)
         
@@ -770,23 +611,15 @@ class UltimateArchiveExtractor:
         
         return [], "No suitable extractor found"
     
-    @run_in_executor
     def find_archives_fast(self, directory: str) -> List[str]:
         """Find all archives"""
         archives = []
         try:
             for root, _, files in os.walk(directory):
                 for file in files:
-                    file_path = os.path.join(root, file)
-                    # Check by extension first
                     ext = os.path.splitext(file)[1].lower()
                     if ext in SUPPORTED_ARCHIVES:
-                        archives.append(file_path)
-                    else:
-                        # Check by content
-                        file_type = detect_file_type_from_content(file_path)
-                        if file_type:
-                            archives.append(file_path)
+                        archives.append(os.path.join(root, file))
         except:
             pass
         return archives
@@ -815,7 +648,6 @@ class UltimateArchiveExtractor:
                     extract_subdir = os.path.join(level_dir, archive_name)
                     os.makedirs(extract_subdir, exist_ok=True)
                     
-                    # Run extraction in executor
                     future = executor.submit(self.extract_single, archive, extract_subdir)
                     futures[future] = (archive, extract_subdir)
                 
@@ -826,7 +658,7 @@ class UltimateArchiveExtractor:
                     
                     archive, extract_subdir = futures[future]
                     try:
-                        extracted, error = future.result(timeout=300)
+                        extracted, error = future.result(timeout=60)
                         
                         if error:
                             errors.append(f"{os.path.basename(archive)}: {error}")
@@ -837,25 +669,22 @@ class UltimateArchiveExtractor:
                                 self.processed_files.add(archive)
                                 self.extracted_count += 1
                             
-                            new_archives = await run_in_executor(self.find_archives_fast)(extract_subdir)
+                            new_archives = self.find_archives_fast(extract_subdir)
                             next_level.update(new_archives)
                             
                             with self.lock:
                                 total_archives += len(new_archives)
                         
-                        # Update progress every time (throttling handled in callback)
                         if self.progress_callback:
                             progress = (self.extracted_count / max(total_archives, 1)) * 100
                             await self.progress_callback(
-                                f"📦 Extracting archives...",
+                                f"📦 Extracting... ({self.extracted_count}/{total_archives})",
                                 progress,
                                 details={
                                     'current': self.extracted_count,
                                     'total': total_archives,
-                                    'level': level,
-                                    'stage': 'extraction'
-                                },
-                                details_text=f"**Archives:** {self.extracted_count}/{total_archives}"
+                                    'level': level
+                                }
                             )
                     except Exception as e:
                         errors.append(f"{os.path.basename(archive)}: {str(e)}")
@@ -886,8 +715,6 @@ class UltimateCookieExtractor:
         self.stop_processing = False
         self.progress_callback = None
         self.error_callback = None
-        self.site_totals = {site: 0 for site in self.target_sites}
-        self.last_progress_time = 0
         
         # Pre-compile patterns for each site
         self.site_patterns = {site: re.compile(site.encode()) for site in self.target_sites}
@@ -900,7 +727,6 @@ class UltimateCookieExtractor:
         """Set error callback"""
         self.error_callback = callback
     
-    @run_in_executor
     def find_cookie_files(self, extract_dir: str) -> List[Tuple[str, str, int]]:
         """Find all cookie files with sizes"""
         cookie_files = []
@@ -911,7 +737,7 @@ class UltimateCookieExtractor:
                 for root, _, files in os.walk(start_dir):
                     if any(folder in root for folder in COOKIE_FOLDERS):
                         for file in files:
-                            if file.endswith(('.txt', '.txt.bak', '.sqlite', '.db')):
+                            if file.endswith(('.txt', '.txt.bak')):
                                 file_path = os.path.join(root, file)
                                 try:
                                     size = os.path.getsize(file_path)
@@ -959,31 +785,17 @@ class UltimateCookieExtractor:
                 self.used_filenames[site].add(new_name)
                 return new_name
     
-    @run_in_executor
     def process_file(self, file_path: str, orig_name: str, file_size: int, extract_dir: str) -> Dict[str, int]:
         """Process a single file - create separate filtered file for each matching site"""
         if self.stop_processing:
             return {}
         
         site_counts = {}
-        
-        # Skip binary files that are too large
-        if file_size > 50 * 1024 * 1024:  # 50MB limit for text files
-            return {}
-        
-        try:
-            # Try to read as text, skip if binary
-            lines = []
             
+        try:
+            # Read file
+            lines = []
             with open(file_path, 'rb', buffering=BUFFER_SIZE) as f:
-                # Check if file is binary
-                sample = f.read(1024)
-                if b'\0' in sample:
-                    # Probably binary file (SQLite, etc.)
-                    return {}
-                
-                # Reset and read all
-                f.seek(0)
                 for chunk in iter(lambda: f.read(CHUNK_SIZE), b''):
                     lines.extend(chunk.split(b'\n'))
             
@@ -1014,9 +826,9 @@ class UltimateCookieExtractor:
                                 with self.stats_lock:
                                     self.total_found += 1
                                     site_counts[site] = site_counts.get(site, 0) + 1
-                                    self.site_totals[site] = self.site_totals.get(site, 0) + 1
             
             # Save SEPARATE file for EACH site that had matches
+            files_saved = 0
             for site, matches in site_matches.items():
                 if matches:
                     # Sort by line number to maintain original order
@@ -1035,6 +847,8 @@ class UltimateCookieExtractor:
                     
                     with self.seen_lock:
                         self.site_files[site][out_path] = unique_name
+                    
+                    files_saved += 1
             
             with self.stats_lock:
                 self.files_processed += 1
@@ -1048,7 +862,7 @@ class UltimateCookieExtractor:
     
     async def process_all(self, extract_dir: str, task_id: str = None) -> Dict[str, int]:
         """Process all files"""
-        cookie_files = await run_in_executor(self.find_cookie_files)(extract_dir)
+        cookie_files = self.find_cookie_files(extract_dir)
         
         if not cookie_files:
             return {}
@@ -1060,7 +874,7 @@ class UltimateCookieExtractor:
             await self.progress_callback(
                 f"🔍 Found {total_files} files (Total: {format_size(total_size)})",
                 0,
-                details={'files': total_files, 'size': total_size, 'stage': 'scanning'}
+                details={'files': total_files, 'size': total_size}
             )
         
         site_totals = {site: 0 for site in self.target_sites}
@@ -1070,7 +884,6 @@ class UltimateCookieExtractor:
             for file_path, orig_name, file_size in cookie_files:
                 if self.stop_processing:
                     break
-                # Submit to executor
                 future = executor.submit(self.process_file, file_path, orig_name, file_size, extract_dir)
                 futures.append(future)
             
@@ -1088,44 +901,29 @@ class UltimateCookieExtractor:
                 
                 completed += 1
                 
-                # Update progress regularly
-                if self.progress_callback:
+                if self.progress_callback and completed % 5 == 0:
                     progress = (completed / total_files) * 100
                     
-                    # Create domain stats text
-                    domains_text = "\n".join([
-                        f"  • **{site}:** {self.site_totals.get(site, 0)} entries"
-                        for site in self.target_sites
-                        if self.site_totals.get(site, 0) > 0
-                    ])
-                    
-                    if not domains_text:
-                        domains_text = "  No matches yet"
-                    
-                    details_text = f"""
-**📊 Progress:** {completed}/{total_files} files
-**🔍 Total Entries Found:** {self.total_found}
-
-**📁 Per-Domain Stats:**
-{domains_text}
-"""
+                    # Create details string
+                    details_text = ""
+                    for site, count in site_totals.items():
+                        if count > 0:
+                            details_text += f"\n  • {site}: {count} entries"
                     
                     await self.progress_callback(
-                        f"🔍 Filtering cookies...",
+                        f"🔍 Filtering... ({completed}/{total_files} files)",
                         progress,
                         details={
                             'files_processed': completed,
                             'total_files': total_files,
                             'entries_found': self.total_found,
-                            'site_totals': self.site_totals,
-                            'stage': 'filtering'
+                            'site_counts': site_totals
                         },
                         details_text=details_text
                     )
         
         return site_totals
     
-    @run_in_executor
     def create_site_zips(self, extract_dir: str, result_folder: str) -> Dict[str, Tuple[str, int]]:
         """Create ZIP archives per site"""
         created_zips = {}
@@ -1166,7 +964,6 @@ class CookieExtractorBot:
         self.user_states = {}  # user_id -> state
         self.user_data = {}  # user_id -> data
         self.last_progress_update = {}  # user_id -> last update time
-        self.active_tasks = {}  # task_id -> asyncio task
         
     async def safe_edit_message(self, message: Message, text: str, **kwargs):
         """Safely edit message with flood wait handling"""
@@ -1188,10 +985,6 @@ class CookieExtractorBot:
         try:
             user_id = message.chat.id
             
-            # Check if task still exists and not cancelled
-            if user_id not in self.user_tasks or self.user_tasks[user_id].get('cancelled'):
-                return
-            
             # Throttle updates (every 5 seconds)
             current_time = time.time()
             if user_id in self.last_progress_update:
@@ -1199,11 +992,11 @@ class CookieExtractorBot:
                     return
             self.last_progress_update[user_id] = current_time
             
-            percent = current * 100 / total if total > 0 else 0
+            percent = current * 100 / total
             elapsed = time.time() - self.user_tasks[user_id]['start_time'] if 'start_time' in self.user_tasks[user_id] else 0
             
             # Calculate ETA
-            if current > 0 and total > 0:
+            if current > 0:
                 speed = current / elapsed if elapsed > 0 else 0
                 eta = (total - current) / speed if speed > 0 else 0
             else:
@@ -1220,10 +1013,10 @@ class CookieExtractorBot:
 `{bar}`  **{percent:.1f}%**
 
 **📄 File:** `{file_name}`
-**📊 Size:** {format_size(current)} / {format_size(total) if total > 0 else 'Unknown'}
+**📊 Size:** {format_size(current)} / {format_size(total)}
 **⚡ Speed:** {format_size(speed)}/s
 **⏱️ Elapsed:** {format_time(elapsed)}
-**⏳ ETA:** {format_time(eta) if eta > 0 and total > 0 else 'Calculating...'}
+**⏳ ETA:** {format_time(eta) if eta > 0 else 'Calculating...'}
 
 **To cancel:** `/cancel_{self.user_tasks[user_id]['task_id']}`
 """
@@ -1233,12 +1026,8 @@ class CookieExtractorBot:
             pass
     
     async def task_progress_callback(self, user_id: int, text: str, percent: float, details: dict = None, details_text: str = ""):
-        """Enhanced task progress callback with per-domain stats"""
+        """Enhanced task progress callback"""
         try:
-            # Check if task still exists and not cancelled
-            if user_id not in self.user_tasks or self.user_tasks[user_id].get('cancelled'):
-                return
-            
             task_info = self.user_tasks.get(user_id)
             if not task_info or not task_info.get('status_message'):
                 return
@@ -1259,92 +1048,40 @@ class CookieExtractorBot:
             cpu_percent = psutil.cpu_percent(interval=0.1)
             memory = psutil.virtual_memory()
             
-            # Determine stage and create appropriate display
-            stage = details.get('stage', 'unknown') if details else 'unknown'
-            
-            if stage == 'extraction':
-                # Extraction progress
-                current_archives = details.get('current', 0)
-                total_archives = details.get('total', 1)
-                level = details.get('level', 0)
-                
-                message_text = f"""
-**📦 Archive Extraction Progress**
-
-`{bar}`  **{percent:.1f}%**
-
-**📋 Status:** {text}
-**📊 Archives:** {current_archives}/{total_archives}
-**📁 Level:** {level}
-**⏱️ Elapsed:** {format_time(elapsed)}
-
-**💻 System:** CPU: {cpu_percent}% | RAM: {memory.percent}%
-
-**To cancel:** `/cancel_{task_info['task_id']}`
-"""
-            
-            elif stage == 'filtering':
-                # Cookie filtering progress with per-domain stats
-                files_processed = details.get('files_processed', 0)
-                total_files = details.get('total_files', 1)
-                entries_found = details.get('entries_found', 0)
-                site_totals = details.get('site_totals', {})
-                
-                # Create domain stats table
-                domain_stats = ""
-                for site, count in site_totals.items():
-                    if count > 0:
-                        domain_stats += f"  • **{site}:** {count} entries\n"
-                
-                if not domain_stats:
-                    domain_stats = "  No matches yet"
-                
-                message_text = f"""
-**🔍 Cookie Filtering Progress**
-
-`{bar}`  **{percent:.1f}%**
-
-**📋 Status:** {text}
-**📁 Files:** {files_processed}/{total_files}
-**🔍 Total Entries:** {entries_found}
-**⏱️ Elapsed:** {format_time(elapsed)}
-
-**📊 Per-Domain Stats:**
-{domain_stats}
-
-**💻 System:** CPU: {cpu_percent}% | RAM: {memory.percent}%
-
-**To cancel:** `/cancel_{task_info['task_id']}`
-"""
-            
-            else:
-                # Generic progress
-                message_text = f"""
+            # Build message
+            message_text = f"""
 **{'📦' if 'Extracting' in text else '🔍'} Task Progress**
 
 `{bar}`  **{percent:.1f}%**
 
 **📋 Status:** {text}
 **⏱️ Elapsed:** {format_time(elapsed)}
+"""
 
-{details_text if details_text else ''}
-
+            if details:
+                if 'current' in details and 'total' in details:
+                    message_text += f"**📊 Archives:** {details['current']}/{details['total']}\n"
+                if 'files_processed' in details and 'total_files' in details:
+                    message_text += f"**📁 Files:** {details['files_processed']}/{details['total_files']}\n"
+                if 'entries_found' in details:
+                    message_text += f"**🔍 Entries:** {details['entries_found']}\n"
+            
+            if details_text:
+                message_text += f"\n{details_text}\n"
+            
+            message_text += f"""
 **💻 System:** CPU: {cpu_percent}% | RAM: {memory.percent}%
 
 **To cancel:** `/cancel_{task_info['task_id']}`
 """
             
             await self.safe_edit_message(task_info['status_message'], message_text)
-        except Exception as e:
-            print(f"Progress callback error: {e}")
+        except Exception:
+            pass
     
     async def error_callback(self, user_id: int, error_text: str):
         """Error callback"""
         try:
-            # Check if task still exists
-            if user_id not in self.user_tasks:
-                return
-                
             task_info = self.user_tasks.get(user_id)
             if task_info and task_info.get('status_message'):
                 await self.safe_edit_message(
@@ -1370,20 +1107,13 @@ class CookieExtractorBot:
 
 Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 100 threads and external tools.
 
-**📦 Supported formats:** `.zip` `.rar` `.7z` `.tar` `.gz` `.bz2` `.xz` `.tgz` `.tbz2`
+**📦 Supported formats:** `.zip` `.rar` `.7z` `.tar` `.gz` `.bz2` `.xz`
 
 **🎯 How to use:**
 1️⃣ Forward me an archive file **OR** send a direct link with `/link <url>`
-2️⃣ I'll automatically detect the file type
-3️⃣ Tell me if it's password protected
-4️⃣ Provide domains to search for (comma-separated)
-5️⃣ I'll extract and send you filtered cookies
-
-**📊 Progress Updates:**
-• Download progress with ETA and speed
-• Extraction progress with archive count
-• Cookie filtering with per-domain stats
-• Updates every {PROGRESS_UPDATE_INTERVAL} seconds
+2️⃣ Tell me if it's password protected
+3️⃣ Provide domains to search for (comma-separated)
+4️⃣ I'll extract and send you filtered cookies
 
 **🛠️ Commands:**
 /start - Show this message
@@ -1408,11 +1138,6 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
 **📦 Supported Archives:**
 {', '.join(SUPPORTED_ARCHIVES)}
 
-**🔍 Auto-Detection:**
-• Detects file type by content (magic bytes)
-• Works even with wrong extensions
-• Supports nested archives
-
 **🔐 Password Protected Archives:**
 • If archive needs password, I'll ask for it
 • You can provide password or try without
@@ -1423,18 +1148,11 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
 • Example: `google.com, youtube.com, github.com`
 • I'll create separate ZIP files for each domain
 • Each file contains ONLY lines matching that domain
-• Live per-domain stats during filtering
 
 **⚡ Performance:**
 • Threads: {MAX_WORKERS} parallel workers
 • Buffer: {format_size(BUFFER_SIZE)}
 • External tools: {'7z' if TOOL_STATUS['7z'] else ''} {'UnRAR' if TOOL_STATUS['unrar'] else ''}
-
-**📊 Progress Updates:**
-• Updates every {PROGRESS_UPDATE_INTERVAL} seconds
-• Download: Shows file name, size, speed, ETA
-• Extraction: Shows archive count and level
-• Filtering: Shows per-domain entry counts
 
 **🛑 Cancel Commands:**
 • `/cancel` - Cancel current task
@@ -1445,30 +1163,19 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
 • Network issues are retried
 • Wrong passwords detected
 • Corrupted archives reported
+
+**📊 Progress Updates:**
+• Updates every {PROGRESS_UPDATE_INTERVAL} seconds
+• Shows ETA, speed, size
+• Cool emoji progress bars
 """
         await message.reply_text(help_text)
     
     async def stats_command(self, client: Client, message: Message):
         """Show bot statistics"""
         # Get disk usage
-        downloads_size = 0
-        extracted_size = 0
-        
-        for dirpath, _, filenames in os.walk(DOWNLOADS_DIR):
-            for f in filenames:
-                file_path = os.path.join(dirpath, f)
-                try:
-                    downloads_size += os.path.getsize(file_path)
-                except:
-                    pass
-        
-        for dirpath, _, filenames in os.walk(EXTRACTED_DIR):
-            for f in filenames:
-                file_path = os.path.join(dirpath, f)
-                try:
-                    extracted_size += os.path.getsize(file_path)
-                except:
-                    pass
+        downloads_size = sum(os.path.getsize(os.path.join(dirpath, f)) for dirpath, _, filenames in os.walk(DOWNLOADS_DIR) for f in filenames)
+        extracted_size = sum(os.path.getsize(os.path.join(dirpath, f)) for dirpath, _, filenames in os.walk(EXTRACTED_DIR) for f in filenames)
         
         # Get active tasks
         active_tasks = len(self.user_tasks)
@@ -1493,18 +1200,19 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
 • UnRAR: {'✅' if TOOL_STATUS['unrar'] else '❌'}
 • rarfile: {'✅' if HAS_RARFILE else '❌'}
 • py7zr: {'✅' if HAS_PY7ZR else '❌'}
+
+**⏰ Uptime:** Calculating...
 """
         await message.reply_text(stats_text)
     
     async def cancel_command(self, client: Client, message: Message):
         """Handle /cancel command"""
         user_id = message.from_user.id
-        command_text = message.text.strip()
         
         # Check if it's a specific cancel
         task_id = None
-        if len(command_text.split()) > 1:
-            task_id = command_text.split()[1]
+        if len(message.text.split()) > 1:
+            task_id = message.text.split()[1]
             if task_id.startswith('cancel_'):
                 task_id = task_id[7:]
             
@@ -1518,10 +1226,6 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
             task_info = self.user_tasks[user_id]
             task_info['cancelled'] = True
             
-            # Cancel the asyncio task if it exists
-            if task_id and task_id in self.active_tasks:
-                self.active_tasks[task_id].cancel()
-            
             # Stop extractors
             if task_info.get('extractor'):
                 task_info['extractor'].stop_extraction = True
@@ -1530,26 +1234,21 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
             
             await message.reply_text("✅ **Task cancelled.** Cleaning up...")
             
-            # Clean up folders in background
-            asyncio.create_task(self.cleanup_task(user_id, task_info))
+            # Clean up folders
+            if task_info.get('download_path') and os.path.exists(task_info['download_path']):
+                await delete_entire_folder(task_info['download_path'])
+            if task_info.get('extract_path') and os.path.exists(task_info['extract_path']):
+                await delete_entire_folder(task_info['extract_path'])
+            
+            # Clean up user data
+            self.user_tasks.pop(user_id, None)
+            self.user_states.pop(user_id, None)
+            self.user_data.pop(user_id, None)
+            self.last_progress_update.pop(user_id, None)
             
             await self.send_log(f"User {user_id} cancelled task {task_id}")
         else:
             await message.reply_text("❌ **No active task found.**")
-    
-    async def cleanup_task(self, user_id: int, task_info: dict):
-        """Clean up task folders in background"""
-        # Clean up folders
-        if task_info.get('download_path') and os.path.exists(task_info['download_path']):
-            await delete_entire_folder(task_info['download_path'])
-        if task_info.get('extract_path') and os.path.exists(task_info['extract_path']):
-            await delete_entire_folder(task_info['extract_path'])
-        
-        # Clean up user data
-        self.user_tasks.pop(user_id, None)
-        self.user_states.pop(user_id, None)
-        self.user_data.pop(user_id, None)
-        self.last_progress_update.pop(user_id, None)
     
     async def link_command(self, client: Client, message: Message):
         """Handle /link command"""
@@ -1575,7 +1274,7 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
         
         # Create task
         task_id = generate_random_string(8)
-        status_msg = await message.reply_text("🔍 **Analyzing link...**")
+        status_msg = await message.reply_text("📥 **Starting download...**")
         
         self.user_tasks[user_id] = {
             'task_id': task_id,
@@ -1592,14 +1291,6 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
             'task_id': task_id
         }
         
-        # Try to detect file type from URL
-        detected_type = detect_file_type_from_url(url)
-        
-        if detected_type:
-            file_type_msg = f"\n📁 **Detected type:** `.{detected_type}`"
-        else:
-            file_type_msg = "\n⚠️ **Could not detect file type from URL**\nI'll detect it after download."
-        
         # Ask if password protected
         keyboard = InlineKeyboardMarkup([
             [
@@ -1609,7 +1300,7 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
         ])
         
         await status_msg.edit_text(
-            f"🔒 **Is this archive password protected?**{file_type_msg}",
+            "🔒 **Is this archive password protected?**",
             reply_markup=keyboard
         )
     
@@ -1626,6 +1317,12 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
         document = message.document
         file_name = document.file_name
         file_ext = os.path.splitext(file_name)[1].lower()
+        
+        if file_ext not in SUPPORTED_ARCHIVES:
+            await message.reply_text(
+                f"❌ **Unsupported file format.**\nSupported: {', '.join(SUPPORTED_ARCHIVES)}"
+            )
+            return
         
         # Check file size (Telegram limit is 2GB)
         if document.file_size > 2 * 1024 * 1024 * 1024:
@@ -1653,12 +1350,6 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
             'task_id': task_id
         }
         
-        # Determine file type message
-        if file_ext in SUPPORTED_ARCHIVES:
-            file_type_msg = f"\n📁 **Type:** `{file_ext}`"
-        else:
-            file_type_msg = f"\n⚠️ **Extension `{file_ext}` not in supported list**\nI'll try to detect by content."
-        
         # Ask if password protected
         keyboard = InlineKeyboardMarkup([
             [
@@ -1669,8 +1360,7 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
         
         await status_msg.edit_text(
             f"**📄 File:** `{file_name}`\n"
-            f"**📊 Size:** {human_readable_size(document.file_size)}"
-            f"{file_type_msg}\n\n"
+            f"**📊 Size:** {human_readable_size(document.file_size)}\n\n"
             f"🔒 **Is this archive password protected?**",
             reply_markup=keyboard
         )
@@ -1764,17 +1454,8 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
                 self.user_data[user_id]['domains'] = valid_domains
                 self.user_states[user_id] = 'processing'
                 
-                # Start processing in background task
-                task_id = self.user_data[user_id]['task_id']
-                task = asyncio.create_task(self.process_task(user_id, message))
-                self.active_tasks[task_id] = task
-                
-                # Remove from active tasks when done
-                def done_callback(fut):
-                    if task_id in self.active_tasks:
-                        del self.active_tasks[task_id]
-                
-                task.add_done_callback(done_callback)
+                # Start processing
+                await self.process_task(user_id, message)
         
         except Exception as e:
             await message.reply_text(f"❌ **Error:** {str(e)}")
@@ -1821,7 +1502,7 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
                     if msg and msg.document:
                         file_name = msg.document.file_name
                         file_size = msg.document.file_size
-                        archive_path = os.path.join(download_path, sanitize_filename(file_name))
+                        archive_path = os.path.join(download_path, file_name)
                         
                         # Download with progress
                         await msg.download(
@@ -1837,51 +1518,11 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
             else:  # link
                 # Download from URL
                 url = data['url']
-                
-                # First, get headers to determine file name and type
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.head(url, allow_redirects=True, timeout=30) as resp:
-                            if resp.status != 200:
-                                # Some servers don't support HEAD, try GET with range
-                                pass
-                            else:
-                                # Try to get filename from Content-Disposition
-                                content_disposition = resp.headers.get('Content-Disposition', '')
-                                if 'filename=' in content_disposition:
-                                    file_name = content_disposition.split('filename=')[1].strip('"\'')
-                                else:
-                                    # Get from URL
-                                    parsed = urlparse(str(resp.url))
-                                    file_name = os.path.basename(parsed.path)
-                                
-                                file_size = int(resp.headers.get('content-length', 0))
-                                content_type = resp.headers.get('content-type', '')
-                except:
-                    # Fallback to URL parsing
-                    parsed = urlparse(url)
-                    file_name = os.path.basename(parsed.path)
-                    file_size = 0
-                
+                file_name = url.split('/')[-1].split('?')[0]
                 if not file_name or '.' not in file_name:
-                    # Try to detect from content-type or generate name
-                    if 'content_type' in locals() and content_type:
-                        # Map content-type to extension
-                        content_type_map = {
-                            'application/zip': '.zip',
-                            'application/x-rar-compressed': '.rar',
-                            'application/x-7z-compressed': '.7z',
-                            'application/x-tar': '.tar',
-                            'application/gzip': '.gz',
-                            'application/x-bzip2': '.bz2',
-                            'application/x-xz': '.xz',
-                        }
-                        ext = content_type_map.get(content_type, '.bin')
-                        file_name = f"archive_{generate_random_string(8)}{ext}"
-                    else:
-                        file_name = f"archive_{generate_random_string(8)}.bin"
+                    file_name = f"archive_{generate_random_string(8)}.zip"
                 
-                archive_path = os.path.join(download_path, sanitize_filename(file_name))
+                archive_path = os.path.join(download_path, file_name)
                 
                 # Download with aiohttp
                 try:
@@ -1890,10 +1531,7 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
                             if resp.status != 200:
                                 raise Exception(f"HTTP {resp.status}")
                             
-                            # Update file_size if we got it from headers
-                            if file_size == 0:
-                                file_size = int(resp.headers.get('content-length', 0))
-                            
+                            file_size = int(resp.headers.get('content-length', 0))
                             downloaded = 0
                             start_time = time.time()
                             
@@ -1914,7 +1552,7 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
                                         percent = (downloaded / file_size) * 100 if file_size > 0 else 0
                                         elapsed = current_time - start_time
                                         speed = downloaded / elapsed if elapsed > 0 else 0
-                                        eta = (file_size - downloaded) / speed if speed > 0 and file_size > 0 else 0
+                                        eta = (file_size - downloaded) / speed if speed > 0 else 0
                                         
                                         bar = create_progress_bar(percent, 15)
                                         
@@ -1924,10 +1562,10 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
 `{bar}`  **{percent:.1f}%**
 
 **📄 File:** `{file_name}`
-**📊 Size:** {format_size(downloaded)} / {format_size(file_size) if file_size > 0 else 'Unknown'}
+**📊 Size:** {format_size(downloaded)} / {format_size(file_size)}
 **⚡ Speed:** {format_size(speed)}/s
 **⏱️ Elapsed:** {format_time(elapsed)}
-**⏳ ETA:** {format_time(eta) if eta > 0 and file_size > 0 else 'Calculating...'}
+**⏳ ETA:** {format_time(eta) if eta > 0 else 'Calculating...'}
 
 **To cancel:** `/cancel_{task_info['task_id']}`
 """
@@ -1943,45 +1581,9 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
             if not os.path.exists(archive_path) or os.path.getsize(archive_path) == 0:
                 raise Exception("Download failed: File is empty or missing")
             
-            # Detect file type after download
-            detected_type = detect_file_type_from_content(archive_path)
-            file_ext = os.path.splitext(archive_path)[1].lower()
-            
-            type_info = f"📁 **Detected type:** "
-            if detected_type:
-                type_info += f"`.{detected_type}`"
-                if file_ext and f".{detected_type}" != file_ext:
-                    type_info += f" (extension was `{file_ext}`)"
-            else:
-                type_info += f"`{file_ext if file_ext else 'Unknown'}`"
-            
-            await self.safe_edit_message(status_msg, f"✅ **Download complete!**\n{type_info}")
             await self.send_log(f"User {user_id} downloaded {file_name} ({format_size(file_size)})")
             
-            # STEP 2: Check if password is correct (quick test)
-            if data.get('password'):
-                await self.safe_edit_message(status_msg, "🔑 **Verifying password...**")
-                
-                # Quick test with first archive
-                test_extractor = UltimateArchiveExtractor(data['password'])
-                test_extractor.stop_extraction = True  # Only test first file
-                
-                # Test with first few bytes
-                try:
-                    test_dir = os.path.join(extract_path, "test")
-                    os.makedirs(test_dir, exist_ok=True)
-                    _, test_error = await run_in_executor(test_extractor.extract_single)(archive_path, test_dir)
-                    
-                    if test_error and "password" in test_error.lower():
-                        raise Exception(f"Incorrect password: {test_error}")
-                    
-                    # Clean up test dir
-                    await delete_entire_folder(test_dir)
-                except Exception as e:
-                    if "password" in str(e).lower():
-                        raise Exception(f"Incorrect password. Please try again with /cancel and restart.")
-            
-            # STEP 3: Extract archives
+            # STEP 2: Extract archives
             await self.safe_edit_message(status_msg, "📦 **Extracting archives...**")
             
             extractor = UltimateArchiveExtractor(data.get('password'))
@@ -2008,7 +1610,7 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
                     error_summary += f"\n... and {len(extract_errors) - 5} more errors"
                 await self.error_callback(user_id, f"Extraction warnings:\n{error_summary}")
             
-            # STEP 4: Filter cookies
+            # STEP 3: Filter cookies
             await self.safe_edit_message(status_msg, "🔍 **Filtering cookies...**")
             
             cookie_extractor = UltimateCookieExtractor(data['domains'])
@@ -2029,11 +1631,11 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
             if task_info.get('cancelled'):
                 raise Exception("Cancelled by user")
             
-            # STEP 5: Create ZIPs
+            # STEP 4: Create ZIPs
             if cookie_extractor.total_found > 0:
                 await self.safe_edit_message(status_msg, "📦 **Creating ZIP archives...**")
                 
-                created_zips = await run_in_executor(cookie_extractor.create_site_zips)(extract_dir, result_folder)
+                created_zips = cookie_extractor.create_site_zips(extract_dir, result_folder)
                 
                 # Send files to user
                 for site, (zip_path, zip_size) in created_zips.items():
@@ -2044,7 +1646,7 @@ Welcome! I can extract cookies from archive files with **ULTIMATE SPEED** using 
 **✅ {site} Cookies**
 
 📊 **Files:** {file_count}
-🔍 **Entries:** site_totals.get(site, 0)
+🔍 **Entries:** {site_totals.get(site, 0)}
 📦 **Size:** {format_size(zip_size)}
 
 #Cookies #{site.replace('.', '_')}
@@ -2114,14 +1716,12 @@ Time: {format_time(elapsed)}
             elif "Incorrect password" in error_msg:
                 await self.safe_edit_message(
                     status_msg,
-                    "❌ **Incorrect password.** Please try again with the correct password.\n"
-                    "Use /cancel and restart."
+                    "❌ **Incorrect password.** Please try again with the correct password."
                 )
             elif "Password required" in error_msg:
                 await self.safe_edit_message(
                     status_msg,
-                    "❌ **Password required.** This archive needs a password.\n"
-                    "Use /cancel and restart with password."
+                    "❌ **Password required.** This archive needs a password."
                 )
             else:
                 await self.safe_edit_message(
@@ -2171,12 +1771,10 @@ Time: {format_time(elapsed)}
 ║   • rarfile: {'✅ Available' if HAS_RARFILE else '❌ Not found'}                    ║
 ║   • py7zr: {'✅ Available' if HAS_PY7ZR else '❌ Not found'}                       ║
 ╠══════════════════════════════════════════════════════════╣
-║ Features:                                                 ║
-║   • Auto file type detection (magic bytes)               ║
-║   • Support for all archive formats                       ║
-║   • 100 threads parallel processing                       ║
-║   • Live progress updates every {PROGRESS_UPDATE_INTERVAL}s                 ║
-║   • Per-domain cookie counts during filtering             ║
+║ Performance:                                              ║
+║   • Threads: {MAX_WORKERS}                                          ║
+║   • Buffer: {format_size(BUFFER_SIZE):>8}                                   ║
+║   • Update Interval: {PROGRESS_UPDATE_INTERVAL}s                                   ║
 ╚══════════════════════════════════════════════════════════╝
         """)
         
