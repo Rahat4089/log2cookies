@@ -4,44 +4,62 @@ FROM python:3.11-slim
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies including libarchive and 7zip
+# Install system dependencies (simplified and working versions)
 RUN apt-get update && apt-get install -y \
     libarchive-dev \
-    libarchive-tools \
     p7zip-full \
-    unrar \
     unzip \
+    gunicorn \
+    flask \
     wget \
     curl \
     git \
     gcc \
     g++ \
     make \
+    --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python packages
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir \
+# Install unrar from non-free repository
+RUN apt-get update && apt-get install -y \
+    unrar \
+    --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python packages in layers for better caching
+RUN pip install --no-cache-dir --upgrade pip
+
+# Install core packages
+RUN pip install --no-cache-dir \
+    pyrogram \
     pyrofork \
-    tgcrypto \
+    tgcrypto
+
+# Install async packages
+RUN pip install --no-cache-dir \
     aiohttp \
-    aiofiles \
+    aiofiles
+
+# Install utility packages
+RUN pip install --no-cache-dir \
     tqdm \
     colorama \
-    psutil \
+    psutil
+
+# Install extraction packages (without libarchive-c which causes issues)
+RUN pip install --no-cache-dir \
     patool \
     pyunpack \
-    libarchive-c \
-    python-magic \
-    python-magic-bin \
     rarfile \
-    py7zr
+    py7zr \
+    zipfile36
 
 # Create necessary directories
 RUN mkdir -p /app/downloads /app/logs
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONIOENCODING=UTF-8
 ENV TZ=UTC
 
 # Create a non-root user to run the bot
@@ -52,7 +70,7 @@ RUN useradd -m -u 1000 botuser && \
 USER botuser
 
 # Copy bot script
-COPY bot.py .
+COPY --chown=botuser:botuser bot.py .
 
 # Create volume for persistent data
 VOLUME ["/app/downloads", "/app/logs"]
