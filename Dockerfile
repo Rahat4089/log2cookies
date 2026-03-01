@@ -31,8 +31,7 @@ RUN pip install --no-cache-dir --upgrade pip
 
 # Install core packages
 RUN pip install --no-cache-dir \
-    pyrogram \
-    pyrofork \
+     pyrofork \
     tgcrypto
 
 # Install async packages
