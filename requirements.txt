@@ -1,25 +1,9 @@
-# Core dependencies
 pyrofork
-tgcrypto
+aiohttp
 aiofiles
-aiohttp
-# System utilities
-psutil
-humanize
-colorama
 tqdm
-
-# Archive handling
-rarfile
-py7zr
-patool
-pyunpack
-
-# Network utilities
-aiohttp
-requests
-
-# Utility
-python-dotenv
+colorama
+psutil
+libarchive-c
 gunicorn
 flask
