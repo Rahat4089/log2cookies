@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: rute-cookie-bot
+    runtime: python
+    region: oregon  # or singapore, frankfurt
+    plan: free  # or starter, professional
+    buildCommand: pip install -r requirements.txt
+    startCommand: python start.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: TZ
+        value: Asia/Kolkata
