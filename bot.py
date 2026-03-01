@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-# bot.py - RUTE Cookie Extractor Bot (ULTRA-FAST WITH LIBARCHIVE)
+# bot.py - RUTE Cookie Extractor Bot (ULTRA-FAST WITH LIBARCHIVE-C ONLY)
 
 import os
 import sys
 import re
-import zipfile
 import shutil
 import hashlib
 import time
@@ -14,6 +13,7 @@ import asyncio
 import aiohttp
 import aiofiles
 import tempfile
+import subprocess
 from datetime import datetime
 from typing import List, Set, Dict, Optional, Tuple, Any
 import threading
@@ -21,17 +21,16 @@ import platform
 import uuid
 from pathlib import Path
 import math
-from concurrent.futures import ThreadPoolExecutor
 import traceback
 import logging
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass
 from enum import Enum
 import queue
-from collections import deque
 import html
 import json
 from urllib.parse import urlparse
+import concurrent.futures
 
 # Pyrofork imports
 from pyrogram import Client, filters
@@ -39,49 +38,6 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, 
 from pyrogram.errors import FloodWait, MessageNotModified, RPCError, MessageIdInvalid
 from pyrogram.handlers import MessageHandler, CallbackQueryHandler
 from pyrogram.enums import ParseMode
-
-# Third-party imports
-try:
-    from tqdm import tqdm
-    import colorama
-    from colorama import Fore, Style
-    colorama.init(autoreset=True)
-except ImportError:
-    os.system("pip install -q tqdm colorama")
-    from tqdm import tqdm
-    import colorama
-    from colorama import Fore, Style
-    colorama.init(autoreset=True)
-
-# Try to import libarchive
-try:
-    import libarchive
-    import libarchive.public
-    import libarchive.constants
-    HAS_LIBARCHIVE = True
-except ImportError:
-    HAS_LIBARCHIVE = False
-    try:
-        os.system("pip install -q libarchive-c")
-        import libarchive
-        import libarchive.public
-        import libarchive.constants
-        HAS_LIBARCHIVE = True
-    except:
-        HAS_LIBARCHIVE = False
-
-# Try to import psutil for stats
-try:
-    import psutil
-    HAS_PSUTIL = True
-except ImportError:
-    HAS_PSUTIL = False
-    try:
-        os.system("pip install -q psutil")
-        import psutil
-        HAS_PSUTIL = True
-    except:
-        HAS_PSUTIL = False
 
 # ==============================================================================
 #                            CONFIGURATION
@@ -108,41 +64,6 @@ ACTIVE_TASK_TIMEOUT = 3600
 QUEUE_TIMEOUT = 0
 
 SUPPORTED_ARCHIVES = {'.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.cab', '.iso', '.lha', '.lzh'}
-ARCHIVE_MAGIC = {
-    b'PK\x03\x04': 'zip',
-    b'PK\x05\x06': 'zip',
-    b'PK\x07\x08': 'zip',
-    b'Rar!\x1a\x07': 'rar',
-    b'Rar!\x1a\x07\x00': 'rar',
-    b'7z\xbc\xaf\x27\x1c': '7z',
-    b'\x1f\x8b': 'gz',
-    b'\x42\x5a\x68': 'bz2',
-    b'\xfd\x37\x7a\x58\x5a\x00': 'xz',
-    b'\x75\x73\x74\x61\x72': 'tar',
-    b'\x75\x73\x74\x61\x72\x20': 'tar',
-    b'MSCF': 'cab',
-    b'CD001': 'iso',
-    b'-lh': 'lha',
-    b'-lz': 'lzh',
-}
-
-# Content-Type mapping
-CONTENT_TYPE_MAP = {
-    'application/zip': '.zip',
-    'application/x-zip-compressed': '.zip',
-    'application/vnd.rar': '.rar',
-    'application/x-rar-compressed': '.rar',
-    'application/x-7z-compressed': '.7z',
-    'application/gzip': '.gz',
-    'application/x-gzip': '.gz',
-    'application/x-bzip2': '.bz2',
-    'application/x-xz': '.xz',
-    'application/x-tar': '.tar',
-    'application/vnd.ms-cab-compressed': '.cab',
-    'application/x-iso9660-image': '.iso',
-    'application/x-lha': '.lha',
-    'application/x-lzh': '.lzh',
-}
 
 # Folders to scan for data
 TARGET_FOLDERS = {
@@ -151,15 +72,17 @@ TARGET_FOLDERS = {
 }
 
 # Files to always scan
-ALWAYS_SCAN_EXTENSIONS = {'.txt', '.log', '.csv', '.data', '.bak', '.old'}
+ALWAYS_SCAN_EXTENSIONS = {'.txt', '.log', '.csv', '.data', '.bak', '.old', '.json', '.sql', '.db'}
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB per file max
 
 # Credit card patterns (pre-compiled for speed)
-CC_PATTERN_WITH_NAME = re.compile(r'(.+?)\s*\|\s*(\d{16})\s*\|\s*(\d{1,2}/\d{4})\s*\|\s*(\d{3,4})')
-CC_PATTERN_NO_NAME = re.compile(r'(\d{16})\s*\|\s*(\d{1,2}/\d{4})\s*\|\s*(\d{3,4})')
+CC_PATTERN_WITH_NAME = re.compile(r'(.+?)\s*\|\s*(\d{13,19})\s*\|\s*(\d{1,2}/\d{2,4})\s*\|\s*(\d{3,4})')
+CC_PATTERN_NO_NAME = re.compile(r'(\d{13,19})\s*\|\s*(\d{1,2}/\d{2,4})\s*\|\s*(\d{3,4})')
+CC_PATTERN_SPACE = re.compile(r'(\d{13,19})\s+(\d{1,2}/\d{2,4})\s+(\d{3,4})')
 
 # Cookie patterns (simple domain matching)
 COOKIE_DOMAIN_PATTERN = re.compile(r'\.([a-zA-Z0-9-]+\.[a-zA-Z]{2,})')
+COOKIE_LINE_PATTERN = re.compile(r'^[^#\s].*?([a-zA-Z0-9-]+\.[a-zA-Z]{2,})')
 
 # Detect system
 SYSTEM = platform.system().lower()
@@ -189,83 +112,6 @@ logger = logging.getLogger(__name__)
 
 # Global start time
 BOT_START_TIME = time.time()
-
-# ==============================================================================
-#                            FILE TYPE DETECTION
-# ==============================================================================
-
-async def detect_file_type_from_url(url: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Detect file type from URL using HEAD request"""
-    try:
-        timeout = aiohttp.ClientTimeout(total=10, connect=5)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.head(url, allow_redirects=True) as response:
-                content_type = response.headers.get('Content-Type', '').lower()
-                content_disposition = response.headers.get('Content-Disposition', '')
-                
-                # Extract filename from Content-Disposition
-                filename = None
-                if content_disposition:
-                    filename_match = re.search(r'filename[^;=\n]*=(([\'"]).*?\2|[^;\n]*)', content_disposition, re.IGNORECASE)
-                    if filename_match:
-                        filename = filename_match.group(1).strip('"\'')
-                
-                # Determine extension from content-type
-                extension = None
-                if content_type:
-                    for ct, ext in CONTENT_TYPE_MAP.items():
-                        if ct in content_type:
-                            extension = ext
-                            break
-                
-                # If no extension from content-type, try from filename
-                if not extension and filename:
-                    ext = os.path.splitext(filename)[1].lower()
-                    if ext in SUPPORTED_ARCHIVES:
-                        extension = ext
-                
-                # If still no extension, try from URL
-                if not extension:
-                    parsed = urlparse(url)
-                    path = parsed.path.lower()
-                    for ext in SUPPORTED_ARCHIVES:
-                        if path.endswith(ext):
-                            extension = ext
-                            break
-                
-                return extension, filename, content_type
-                
-    except Exception as e:
-        logger.error(f"Error detecting file type from URL: {e}")
-        return None, None, None
-
-def detect_file_type_from_content(file_path: str) -> Optional[str]:
-    """Detect file type by reading magic bytes"""
-    try:
-        with open(file_path, 'rb') as f:
-            header = f.read(1024)
-        
-        # Check against known signatures
-        for signature, file_type in ARCHIVE_MAGIC.items():
-            if header.startswith(signature):
-                return file_type
-        
-        # Check for tar variants
-        if header[257:262] in [b'ustar', b'ustar\x00']:
-            return 'tar'
-        
-        return None
-    except Exception as e:
-        logger.error(f"Error detecting file type: {e}")
-        return None
-
-def get_extension_from_type(file_type: str) -> str:
-    """Convert file type to extension"""
-    if not file_type:
-        return '.zip'
-    if file_type.startswith('.'):
-        return file_type
-    return f'.{file_type}'
 
 # ==============================================================================
 #                            ENUMS & DATACLASSES
@@ -327,7 +173,7 @@ class ExtractedData:
         """Add a credit card with deduplication"""
         with self.lock:
             # Extract card number for deduplication
-            card_num = card_str.split('|')[0]
+            card_num = card_str.split('|')[0] if '|' in card_str else card_str.split()[0]
             if card_num not in self.seen_cards:
                 self.seen_cards.add(card_num)
                 self.credit_cards.append(card_str)
@@ -342,7 +188,7 @@ class TaskData:
     message_id: int
     source_type: SourceType
     source_data: Any
-    extraction_type: ExtractionType = ExtractionType.BOTH  # Default to both
+    extraction_type: ExtractionType = ExtractionType.BOTH
     domains: List[str] = None
     password: Optional[str] = None
     stage: TaskStage = TaskStage.INIT
@@ -359,7 +205,6 @@ class TaskData:
     file_size: int = 0
     forwarded: bool = False
     forwarded_message_id: int = None
-    detected_type: str = None
     
     def __post_init__(self):
         if self.created_at is None:
@@ -399,92 +244,104 @@ class TaskData:
         return os.path.join(user_folder, f"results_{self.task_id}")
 
 # ==============================================================================
-#                            LIBARCHIVE EXTRACTOR
+#                            LIBARCHIVE-C EXTRACTOR (SUBPROCESS ONLY)
 # ==============================================================================
 
 class LibArchiveExtractor:
-    """Universal extractor using libarchive"""
+    """Universal extractor using libarchive-c with subprocess"""
     
     def __init__(self, password: str = None, task_id: str = None):
         self.password = password
         self.task_id = task_id
         self.stop_processing = False
-        self.has_libarchive = HAS_LIBARCHIVE
         
-        if not self.has_libarchive:
-            logger.error("libarchive-c not available! Using fallback extraction.")
+        # Check if bsdtar (libarchive) is available
+        self.has_bsdtar = self._check_bsdtar()
+        
+        if not self.has_bsdtar:
+            logger.error("bsdtar (libarchive) not found in PATH! Extraction will fail.")
+    
+    def _check_bsdtar(self) -> bool:
+        """Check if bsdtar is available"""
+        try:
+            result = subprocess.run(['bsdtar', '--version'], 
+                                   capture_output=True, 
+                                   text=True, 
+                                   timeout=5)
+            logger.info(f"Found bsdtar: {result.stdout.strip()}")
+            return True
+        except (subprocess.SubprocessError, FileNotFoundError):
+            try:
+                # Try 'tar' with libarchive backend on some systems
+                result = subprocess.run(['tar', '--version'], 
+                                       capture_output=True, 
+                                       text=True, 
+                                       timeout=5)
+                if 'libarchive' in result.stdout.lower():
+                    logger.info(f"Found tar with libarchive: {result.stdout.strip()}")
+                    return True
+            except:
+                pass
+            
+            logger.error("bsdtar/libarchive not found. Please install libarchive-tools")
+            return False
     
     async def extract_archive(self, archive_path: str, extract_to: str) -> bool:
-        """Extract any archive using libarchive"""
-        if not self.has_libarchive:
-            return await self._fallback_extract(archive_path, extract_to)
+        """Extract any archive using bsdtar (libarchive)"""
+        if not self.has_bsdtar:
+            raise Exception("bsdtar (libarchive) not available")
         
         try:
-            # Use libarchive for extraction
-            def extract_with_libarchive():
-                try:
-                    with libarchive.public.file_reader(archive_path) as archive:
-                        for entry in archive:
-                            if self.stop_processing:
-                                return False
-                            
-                            # Skip directories, they'll be created automatically
-                            if entry.isdir:
-                                continue
-                            
-                            # Build output path
-                            out_path = os.path.join(extract_to, entry.pathname)
-                            os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                            
-                            # Extract file
-                            with open(out_path, 'wb') as f:
-                                for block in entry.get_blocks():
-                                    f.write(block)
-                    return True
-                except Exception as e:
-                    logger.error(f"Libarchive extraction error: {e}")
-                    return False
+            os.makedirs(extract_to, exist_ok=True)
             
-            return await asyncio.to_thread(extract_with_libarchive)
+            # Build bsdtar command
+            cmd = ['bsdtar', '-xf', archive_path, '-C', extract_to]
             
-        except Exception as e:
-            logger.error(f"Libarchive error: {e}")
-            return await self._fallback_extract(archive_path, extract_to)
-    
-    async def _fallback_extract(self, archive_path: str, extract_to: str) -> bool:
-        """Fallback extraction for unsupported formats"""
-        ext = os.path.splitext(archive_path)[1].lower()
-        
-        # Try Python's built-in modules as fallback
-        try:
-            if ext == '.zip':
-                with zipfile.ZipFile(archive_path, 'r') as zf:
-                    if self.password:
-                        zf.setpassword(self.password.encode())
-                    await asyncio.to_thread(zf.extractall, extract_to)
-                return True
-            
-            elif ext in ['.tar', '.gz', '.bz2', '.xz']:
-                import tarfile
-                mode = 'r'
-                if ext == '.gz':
-                    mode = 'r:gz'
-                elif ext == '.bz2':
-                    mode = 'r:bz2'
-                elif ext == '.xz':
-                    mode = 'r:xz'
+            # Add password if provided
+            if self.password:
+                # For encrypted archives, we need to pass password differently
+                # Some formats use --password, others use environment variable
+                env = os.environ.copy()
+                env['BSDTAR_PASSWORD'] = self.password
                 
-                with tarfile.open(archive_path, mode) as tar:
-                    await asyncio.to_thread(tar.extractall, extract_to)
-                return True
-            
+                # Try with --password option first
+                cmd_with_pass = ['bsdtar', '-xf', archive_path, '-C', extract_to, 
+                                f'--password={self.password}']
+                
+                # Run with password option
+                process = await asyncio.create_subprocess_exec(
+                    *cmd_with_pass,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env
+                )
             else:
-                logger.error(f"No fallback for {ext}")
-                return False
+                # Run without password
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+            
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                error_msg = stderr.decode('utf-8', errors='ignore')
+                logger.error(f"bsdtar error: {error_msg}")
                 
+                # Check for password errors
+                if 'password' in error_msg.lower() or 'encrypted' in error_msg.lower():
+                    raise Exception("Archive is encrypted or wrong password")
+                else:
+                    raise Exception(f"Extraction failed: {error_msg[:200]}")
+            
+            return True
+            
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.error(f"Fallback extraction error: {e}")
-            return False
+            logger.error(f"Extraction error: {e}")
+            raise
     
     async def find_archives(self, directory: str) -> List[str]:
         """Find all archives in directory recursively"""
@@ -494,28 +351,20 @@ class LibArchiveExtractor:
             local_archives = []
             for root, _, files in os.walk(directory):
                 for file in files:
-                    # Check by extension
                     ext = os.path.splitext(file)[1].lower()
                     if ext in SUPPORTED_ARCHIVES:
                         local_archives.append(os.path.join(root, file))
-                    else:
-                        # Check by magic bytes
-                        file_path = os.path.join(root, file)
-                        try:
-                            if detect_file_type_from_content(file_path):
-                                local_archives.append(file_path)
-                        except:
-                            pass
             return local_archives
         
         return await asyncio.to_thread(scan)
     
     async def extract_all_nested(self, archive_path: str, extract_dir: str, progress_callback=None) -> Tuple[str, int]:
-        """Extract all nested archives recursively"""
+        """Extract all nested archives recursively using bsdtar"""
         # First extraction
-        success = await self.extract_archive(archive_path, extract_dir)
-        if not success:
-            raise Exception("Archive extraction failed - wrong password or corrupted file")
+        try:
+            await self.extract_archive(archive_path, extract_dir)
+        except Exception as e:
+            raise Exception(f"Archive extraction failed: {e}")
         
         extracted_count = 1
         
@@ -541,18 +390,18 @@ class LibArchiveExtractor:
                 if self.stop_processing:
                     break
                 
-                # Extract to same directory (flatten)
                 try:
-                    success = await self.extract_archive(arc_path, extract_dir)
-                    if success:
-                        new_extractions += 1
-                        extracted_count += 1
+                    # Extract to same directory (flatten)
+                    await self.extract_archive(arc_path, extract_dir)
+                    new_extractions += 1
+                    extracted_count += 1
+                    
+                    # Remove archive after extraction
+                    try:
+                        os.remove(arc_path)
+                    except:
+                        pass
                         
-                        # Remove archive after extraction
-                        try:
-                            os.remove(arc_path)
-                        except:
-                            pass
                 except Exception as e:
                     logger.error(f"Failed to extract nested {arc_path}: {e}")
             
@@ -578,17 +427,13 @@ class DataExtractor:
         self.stop_processing = False
         self.extracted_data = ExtractedData()
         
-        # Pre-compile domain patterns for speed
-        self.domain_patterns = {}
-        if self.target_domains:
-            for domain in self.target_domains:
-                escaped = re.escape(domain).replace(r'\*', '.*')
-                self.domain_patterns[domain] = re.compile(escaped.encode() if isinstance(escaped, str) else escaped)
+        # Thread pool for parallel file processing
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
     
     def should_process_file(self, file_path: str) -> bool:
         """Check if file should be processed"""
-        # Check file size first (fast check)
         try:
+            # Check file size first (fast check)
             size = os.path.getsize(file_path)
             if size > MAX_FILE_SIZE or size == 0:
                 return False
@@ -615,9 +460,6 @@ class DataExtractor:
     
     def process_file_content(self, content: str, file_path: str):
         """Process file content for both cookies and credit cards"""
-        content_bytes = content.encode('utf-8', errors='ignore')
-        content_lower = content.lower()
-        
         # 1. Extract credit cards (fast regex)
         for match in CC_PATTERN_WITH_NAME.finditer(content):
             name, card, expiry, cvv = match.groups()
@@ -626,6 +468,12 @@ class DataExtractor:
                 self.extracted_data.add_credit_card(formatted)
         
         for match in CC_PATTERN_NO_NAME.finditer(content):
+            card, expiry, cvv = match.groups()
+            if self._validate_card(card, expiry):
+                formatted = f"{card}|{expiry}|{cvv}"
+                self.extracted_data.add_credit_card(formatted)
+        
+        for match in CC_PATTERN_SPACE.finditer(content):
             card, expiry, cvv = match.groups()
             if self._validate_card(card, expiry):
                 formatted = f"{card}|{expiry}|{cvv}"
@@ -651,11 +499,51 @@ class DataExtractor:
                             self.extracted_data.add_cookie(domain, line)
     
     def _validate_card(self, card: str, expiry: str) -> bool:
-        """Quick card validation"""
+        """Quick card validation using Luhn algorithm"""
         try:
-            month, year = expiry.split('/')
-            year_int = int(year)
-            return 2020 <= year_int <= 2035 and len(card) == 16 and card.isdigit()
+            # Check length
+            if len(card) not in [15, 16, 19]:
+                return False
+            
+            # Check if all digits
+            if not card.isdigit():
+                return False
+            
+            # Quick Luhn check
+            total = 0
+            reverse_digits = [int(d) for d in card[::-1]]
+            for i, digit in enumerate(reverse_digits):
+                if i % 2 == 1:
+                    doubled = digit * 2
+                    total += doubled if doubled < 10 else doubled - 9
+                else:
+                    total += digit
+            if total % 10 != 0:
+                return False
+            
+            # Validate expiry
+            parts = expiry.replace(' ', '').split('/')
+            if len(parts) != 2:
+                return False
+            
+            month, year = parts
+            month = int(month)
+            
+            # Handle 2 or 4 digit year
+            if len(year) == 2:
+                year = 2000 + int(year)
+            else:
+                year = int(year)
+            
+            # Basic validity
+            if month < 1 or month > 12:
+                return False
+            
+            if year < 2023 or year > 2035:
+                return False
+            
+            return True
+            
         except:
             return False
     
@@ -676,12 +564,14 @@ class DataExtractor:
             return False
         
         try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
+            # Use asyncio.to_thread for file I/O
+            def read_and_process():
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                self.process_file_content(content, file_path)
+                return True
             
-            self.process_file_content(content, file_path)
-            self.extracted_data.files_processed += 1
-            return True
+            return await asyncio.to_thread(read_and_process)
             
         except Exception as e:
             logger.error(f"Error processing {file_path}: {e}")
@@ -691,26 +581,23 @@ class DataExtractor:
         """Find all files that should be scanned"""
         files_to_scan = []
         
-        def scan_worker(start_dir):
-            local_files = []
-            try:
-                for root, _, files in os.walk(start_dir):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        if self.should_process_file(file_path):
-                            local_files.append(file_path)
-            except Exception as e:
-                logger.error(f"Scan error: {e}")
-            return local_files
+        try:
+            for root, _, files in os.walk(extract_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    if self.should_process_file(file_path):
+                        files_to_scan.append(file_path)
+        except Exception as e:
+            logger.error(f"Scan error: {e}")
         
-        return scan_worker(extract_dir)
+        return files_to_scan
     
     async def process_all(self, extract_dir: str, progress_callback=None) -> ExtractedData:
         """Process all files in a single pass"""
         if progress_callback:
             await progress_callback("🔍 Scanning for files to process...")
         
-        # Find all files in thread pool
+        # Find all files
         files_to_scan = await asyncio.to_thread(self.find_files_to_scan, extract_dir)
         
         if not files_to_scan:
@@ -724,31 +611,32 @@ class DataExtractor:
         processed = 0
         total = len(files_to_scan)
         
-        # Process in batches
-        batch_size = 20
+        # Process files in parallel using asyncio.gather
+        batch_size = 50
         for i in range(0, total, batch_size):
             if self.stop_processing:
                 break
             
             batch = files_to_scan[i:i+batch_size]
             
-            # Process batch in thread pool
-            def process_batch():
-                for file_path in batch:
-                    if self.stop_processing:
-                        break
-                    asyncio.run(self.process_file(file_path))
-            
-            await asyncio.to_thread(process_batch)
+            # Process batch in parallel
+            tasks = [self.process_file(file_path) for file_path in batch]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
             
             processed += len(batch)
             
-            if progress_callback and processed % 10 == 0:
+            # Count successful processing
+            for result in results:
+                if result is True:
+                    self.extracted_data.files_processed += 1
+            
+            if progress_callback and (processed % 20 == 0 or processed == total):
                 progress_text = f"🔍 Scanning files...\n"
                 progress_text += f"📊 Files: {processed}/{total}\n"
                 
                 if self.extracted_data.cookies:
-                    progress_text += f"🍪 Cookies: {sum(len(v) for v in self.extracted_data.cookies.values())}\n"
+                    cookies_count = sum(len(v) for v in self.extracted_data.cookies.values())
+                    progress_text += f"🍪 Cookies: {cookies_count}\n"
                 if self.extracted_data.credit_cards:
                     progress_text += f"💳 Cards: {len(self.extracted_data.credit_cards)}\n"
                 
@@ -762,6 +650,8 @@ class DataExtractor:
     def create_result_files(self, result_folder: str) -> Dict[str, str]:
         """Create all result files (cookies per domain + credit cards)"""
         created_files = {}
+        
+        os.makedirs(result_folder, exist_ok=True)
         
         # Create cookie files per domain
         for domain, lines in self.extracted_data.cookies.items():
@@ -785,8 +675,11 @@ class DataExtractor:
             file_name = f"credit_cards_{timestamp}.txt"
             file_path = os.path.join(result_folder, file_name)
             
+            # Sort cards by expiry for better organization
+            cards = sorted(self.extracted_data.credit_cards)
+            
             with open(file_path, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(self.extracted_data.credit_cards))
+                f.write('\n'.join(cards))
             
             created_files['credit_cards'] = file_path
         
@@ -821,7 +714,7 @@ class DownloadManager:
                     if progress_callback:
                         await progress_callback(f"📥 Downloading... 0%")
                     
-                    # Download to temporary file first
+                    # Download to temporary file
                     temp_path = file_path + ".tmp"
                     
                     async with aiofiles.open(temp_path, 'wb') as f:
@@ -844,15 +737,7 @@ class DownloadManager:
                                 text += f"⏱️ ETA: {format_time(eta)}"
                                 await progress_callback(text)
                     
-                    # Detect file type from content
-                    file_type = await asyncio.to_thread(detect_file_type_from_content, temp_path)
-                    
-                    if file_type:
-                        new_file_path = os.path.splitext(file_path)[0] + get_extension_from_type(file_type)
-                        os.rename(temp_path, new_file_path)
-                        file_path = new_file_path
-                    else:
-                        os.rename(temp_path, file_path)
+                    os.rename(temp_path, file_path)
                     
                     if progress_callback:
                         await progress_callback(f"✅ Download complete!")
@@ -874,9 +759,22 @@ class DownloadManager:
             
             start_time = time.time()
             
+            # Get file size
+            if message.document:
+                total_size = message.document.file_size
+            elif message.photo:
+                total_size = message.photo.file_size
+            else:
+                return False, "Unsupported media type"
+            
+            downloaded = 0
+            
             async def progress(current, total):
+                nonlocal downloaded
                 if self.stop_download:
                     raise Exception("Download cancelled")
+                
+                downloaded = current
                 
                 if progress_callback:
                     percentage = (current / total) * 100
@@ -890,30 +788,20 @@ class DownloadManager:
                     text += f"⏱️ ETA: {format_time(eta)}"
                     await progress_callback(text)
             
-            # Download to temporary file first
+            # Download to temporary file
             temp_path = file_path + ".tmp"
             
-            # Download in thread pool
+            # Download
             if message.document:
                 await asyncio.to_thread(
-                    lambda: message.download(temp_path, progress=progress)
+                    lambda: message.download(file_path=temp_path, progress=progress)
                 )
             elif message.photo:
                 await asyncio.to_thread(
-                    lambda: message.photo.download(temp_path, progress=progress)
+                    lambda: message.photo.download(file_path=temp_path, progress=progress)
                 )
-            else:
-                return False, "Unsupported media type"
             
-            # Detect file type from content
-            file_type = await asyncio.to_thread(detect_file_type_from_content, temp_path)
-            
-            if file_type:
-                new_file_path = os.path.splitext(file_path)[0] + get_extension_from_type(file_type)
-                os.rename(temp_path, new_file_path)
-                file_path = new_file_path
-            else:
-                os.rename(temp_path, file_path)
+            os.rename(temp_path, file_path)
             
             if progress_callback:
                 await progress_callback(f"✅ Download complete!")
@@ -1149,8 +1037,8 @@ class ErrorHandler:
         elif isinstance(error, ConnectionError):
             return "🌐 Network connection error. Please check your internet."
         
-        elif "password" in str(error).lower() or "Wrong password" in str(error).lower():
-            return "🔑 Wrong password or archive is password protected."
+        elif "password" in str(error).lower() or "encrypted" in str(error).lower():
+            return "🔑 Wrong password or archive is encrypted."
         
         elif "disk" in str(error).lower() or "space" in str(error).lower():
             return "💿 Insufficient disk space. Free up space and try again."
@@ -1172,11 +1060,13 @@ def generate_random_string(length: int = 6) -> str:
 
 def format_size(size_bytes: int) -> str:
     """Quick size formatting"""
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if size_bytes < 1024.0:
-            return f"{size_bytes:.1f}{unit}"
-        size_bytes /= 1024.0
-    return f"{size_bytes:.1f}TB"
+    if size_bytes == 0:
+        return "0B"
+    size_names = ["B", "KB", "MB", "GB", "TB"]
+    i = int(math.floor(math.log(size_bytes, 1024)))
+    p = math.pow(1024, i)
+    s = round(size_bytes / p, 2)
+    return f"{s}{size_names[i]}"
 
 def format_time(seconds: float) -> str:
     """Format seconds to human readable"""
@@ -1186,11 +1076,6 @@ def format_time(seconds: float) -> str:
         return f"{seconds/60:.1f}m"
     else:
         return f"{seconds/3600:.1f}h"
-
-def create_progress_bar(percentage: float, width: int = 10) -> str:
-    """Create a text progress bar"""
-    filled = int(width * percentage / 100)
-    return '█' * filled + '░' * (width - filled)
 
 def escape_html(text: str) -> str:
     """Escape HTML special characters"""
@@ -1224,33 +1109,18 @@ class StatsCollector:
             'release': platform.release(),
             'python_version': platform.python_version(),
             'hostname': platform.node(),
-            'architecture': platform.machine(),
-            'libarchive': '✅' if HAS_LIBARCHIVE else '❌'
+            'architecture': platform.machine()
         }
         
+        # Check if bsdtar is available
         try:
-            if HAS_PSUTIL:
-                stats['cpu_percent'] = psutil.cpu_percent(interval=1)
-                stats['cpu_count'] = psutil.cpu_count()
-                
-                mem = psutil.virtual_memory()
-                stats['memory_total'] = mem.total
-                stats['memory_available'] = mem.available
-                stats['memory_used'] = mem.used
-                stats['memory_percent'] = mem.percent
-                
-                disk = psutil.disk_usage('/')
-                stats['disk_total'] = disk.total
-                stats['disk_used'] = disk.used
-                stats['disk_free'] = disk.free
-                stats['disk_percent'] = disk.percent
-                
-                process = psutil.Process()
-                stats['process_memory'] = process.memory_info().rss
-                stats['process_threads'] = process.num_threads()
-            
-        except Exception as e:
-            logger.error(f"Error getting server stats: {e}")
+            result = subprocess.run(['bsdtar', '--version'], 
+                                   capture_output=True, 
+                                   text=True, 
+                                   timeout=2)
+            stats['libarchive'] = result.stdout.strip().split('\n')[0]
+        except:
+            stats['libarchive'] = 'Not found'
         
         return stats
     
@@ -1262,7 +1132,6 @@ class StatsCollector:
             'active_tasks': queue_manager.get_active_count(),
             'queued_tasks': queue_manager.get_queue_count(),
             'max_concurrent': MAX_CONCURRENT_USERS,
-            'libarchive': '✅' if HAS_LIBARCHIVE else '❌',
             'uptime': time.time() - BOT_START_TIME,
             'workers': MAX_WORKERS
         }
@@ -1289,15 +1158,6 @@ class StatsCollector:
         stats['total_credit_cards'] = total_cc
         
         return stats
-    
-    @staticmethod
-    def format_bytes(bytes_num: int) -> str:
-        """Format bytes to human readable"""
-        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-            if bytes_num < 1024.0:
-                return f"{bytes_num:.2f} {unit}"
-            bytes_num /= 1024.0
-        return f"{bytes_num:.2f} PB"
     
     @staticmethod
     def format_time(seconds: float) -> str:
@@ -1395,8 +1255,22 @@ class RUTEBot:
         self.bot = self.app
         self._running = False
         
+        # Check libarchive availability
+        self.has_bsdtar = self._check_bsdtar()
+        
         logger.info("Bot initialized")
-        logger.info(f"Libarchive: {'✅' if HAS_LIBARCHIVE else '❌'}")
+        logger.info(f"Libarchive (bsdtar): {'✅' if self.has_bsdtar else '❌'}")
+    
+    def _check_bsdtar(self) -> bool:
+        """Check if bsdtar is available"""
+        try:
+            result = subprocess.run(['bsdtar', '--version'], 
+                                   capture_output=True, 
+                                   text=True, 
+                                   timeout=5)
+            return True
+        except:
+            return False
     
     async def start(self):
         """Start the bot"""
@@ -1407,12 +1281,24 @@ class RUTEBot:
             
             logger.info("Bot started successfully")
             
+            if not self.has_bsdtar:
+                logger.error("WARNING: bsdtar (libarchive) not found! Extraction will fail!")
+                try:
+                    await self.app.send_message(
+                        LOG_CHANNEL,
+                        "<b>⚠️ Warning: bsdtar not found!</b>\n\n"
+                        "Please install libarchive-tools:\n"
+                        "apt-get install libarchive-tools"
+                    )
+                except:
+                    pass
+            
             if SEND_LOGS:
                 try:
                     await self.app.send_message(
                         LOG_CHANNEL,
                         f"<b>🚀 Bot Started</b>\n\n"
-                        f"📊 Libarchive: {'✅' if HAS_LIBARCHIVE else '❌'}\n"
+                        f"📊 Libarchive: {'✅' if self.has_bsdtar else '❌'}\n"
                         f"⚡ Max concurrent: {MAX_CONCURRENT_USERS}"
                     )
                 except Exception as e:
@@ -1467,10 +1353,12 @@ class RUTEBot:
         active = self.queue_manager.get_active_count()
         queued = self.queue_manager.get_queue_count()
         
+        libarchive_status = "✅ libarchive (bsdtar)" if self.has_bsdtar else "❌ libarchive (bsdtar not found!)"
+        
         return f"""
 <b>🚀 LOGS Extractor Bot</b>
 
-<b>Extraction Engine:</b> {'✅ libarchive' if HAS_LIBARCHIVE else '❌ libarchive (using fallbacks)'}
+<b>Extraction Engine:</b> {libarchive_status}
 
 <b>Queue Status:</b>
 • Active: {active}/{MAX_CONCURRENT_USERS}
@@ -1487,7 +1375,7 @@ class RUTEBot:
 
 <b>Features:</b>
 ✅ Single-pass extraction (cookies + credit cards at once)
-✅ Libarchive for all archive types
+✅ Libarchive (bsdtar) for all archive types
 ✅ Credit card format: cc|mm/yyyy|cvv|name or cc|mm/yyyy|cvv
 ✅ Auto-delete user data after completion
         """
@@ -1528,11 +1416,6 @@ class RUTEBot:
             
             server_text += f"<b>System:</b> {server_stats['system']}\n"
             server_text += f"<b>Libarchive:</b> {server_stats['libarchive']}\n"
-            
-            if HAS_PSUTIL:
-                server_text += f"\n<b>CPU:</b> {server_stats.get('cpu_percent', 0):.1f}% ({server_stats.get('cpu_count', 0)} cores)\n"
-                server_text += f"<b>Memory:</b> {StatsCollector.format_bytes(server_stats.get('memory_used', 0))} / {StatsCollector.format_bytes(server_stats.get('memory_total', 0))} ({server_stats.get('memory_percent', 0):.1f}%)\n"
-                server_text += f"<b>Disk:</b> {StatsCollector.format_bytes(server_stats.get('disk_used', 0))} / {StatsCollector.format_bytes(server_stats.get('disk_total', 0))} ({server_stats.get('disk_percent', 0):.1f}%)"
             
             # Format bot stats
             bot_text = f"\n<b>🤖 Bot Statistics</b>\n\n"
@@ -1706,24 +1589,9 @@ class RUTEBot:
                 await message.reply("❌ Invalid URL. Must start with http:// or https://")
                 return
             
-            # Send "detecting" message
-            detecting_msg = await message.reply("🔍 Detecting file type from URL...")
-            
-            # Detect file type from URL
-            extension, filename, content_type = await detect_file_type_from_url(url)
-            
-            if extension:
-                await detecting_msg.edit_text(f"✅ Detected: {extension} archive")
-            else:
-                await detecting_msg.edit_text("⚠️ Could not detect file type, will try after download")
-            
             # Create task
             task_id = str(uuid.uuid4())[:8]
-            
-            if filename:
-                file_name = filename
-            else:
-                file_name = f"archive_{task_id}{extension or '.zip'}"
+            file_name = f"url_archive_{task_id}.zip"
             
             task = TaskData(
                 task_id=task_id,
@@ -1734,16 +1602,14 @@ class RUTEBot:
                 source_data=url,
                 bot=self,
                 file_name=file_name,
-                file_size=0,
-                detected_type=extension
+                file_size=0
             )
             
             await self.task_manager.create_task(task)
             
             # Ask for domains (optional)
             status_msg = await message.reply(
-                f"<b>📦 File:</b> <code>{escape_html(file_name)}</code>\n"
-                f"<b>🔍 Detected:</b> {extension or 'Unknown'}\n\n"
+                f"<b>📦 URL:</b> <code>{escape_html(url[:50])}...</code>\n\n"
                 f"<b>Enter target domains (optional):</b>\n"
                 f"Send comma-separated domains to filter cookies.\n"
                 f"Leave empty to only extract credit cards.\n\n"
@@ -1809,8 +1675,7 @@ class RUTEBot:
                 },
                 bot=self,
                 file_name=file_name,
-                file_size=doc.file_size,
-                detected_type=ext
+                file_size=doc.file_size
             )
             
             await self.task_manager.create_task(task)
@@ -2075,11 +1940,6 @@ class RUTEBot:
             server_text += f"<b>System:</b> {server_stats['system']}\n"
             server_text += f"<b>Libarchive:</b> {server_stats['libarchive']}\n"
             
-            if HAS_PSUTIL:
-                server_text += f"\n<b>CPU:</b> {server_stats.get('cpu_percent', 0):.1f}% ({server_stats.get('cpu_count', 0)} cores)\n"
-                server_text += f"<b>Memory:</b> {StatsCollector.format_bytes(server_stats.get('memory_used', 0))} / {StatsCollector.format_bytes(server_stats.get('memory_total', 0))} ({server_stats.get('memory_percent', 0):.1f}%)\n"
-                server_text += f"<b>Disk:</b> {StatsCollector.format_bytes(server_stats.get('disk_used', 0))} / {StatsCollector.format_bytes(server_stats.get('disk_total', 0))} ({server_stats.get('disk_percent', 0):.1f}%)"
-            
             bot_text = f"\n<b>🤖 Bot Statistics</b>\n\n"
             bot_text += f"• Uptime: {StatsCollector.format_time(bot_stats['uptime'])}\n"
             bot_text += f"• Total tasks: {bot_stats['total_tasks']}\n"
@@ -2152,11 +2012,11 @@ class RUTEBot:
             about_text = f"""
 <b>ℹ️ About RUTE Extractor Bot</b>
 
-<b>Version:</b> 4.0.0 (Libarchive Edition)
+<b>Version:</b> 4.0.0 (Libarchive-C Only)
 <b>Description:</b> Advanced Telegram bot for extracting cookies and credit cards.
 
 <b>Features:</b>
-• Universal extraction with libarchive
+• Universal extraction with libarchive (bsdtar)
 • Single-pass processing (cookies + cards at once)
 • Supports: ZIP, RAR, 7z, TAR, GZ, BZ2, XZ, CAB, ISO, LHA, LZH
 • Credit card format: cc|mm/yyyy|cvv|name or cc|mm/yyyy|cvv
@@ -2164,7 +2024,7 @@ class RUTEBot:
 • Auto-delete user data after completion
 
 <b>Engine:</b>
-• Libarchive: {'✅' if HAS_LIBARCHIVE else '❌'} (fallbacks available)
+• Libarchive: {'✅ bsdtar' if self.has_bsdtar else '❌ Not found'}
 • Max workers: {MAX_WORKERS}
 • Active timeout: {ACTIVE_TASK_TIMEOUT//60} minutes
             """
@@ -2202,6 +2062,7 @@ class RUTEBot:
 <b>Credit Card Format:</b>
 • With name: <code>cc|mm/yyyy|cvv|name</code>
 • Without name: <code>cc|mm/yyyy|cvv</code>
+• Also supports space-separated format
 
 <b>Supported Formats:</b>
 {', '.join(SUPPORTED_ARCHIVES)}
@@ -2473,12 +2334,16 @@ Use /status to check your position.
                     if isinstance(result, str):
                         download_path = result
             
+            # Check if bsdtar is available
+            if not self.has_bsdtar:
+                raise Exception("bsdtar (libarchive) not found on system. Please install libarchive-tools")
+            
             # Update stage
             task.stage = TaskStage.PROCESSING
             await self.task_manager.update_task(task.task_id, stage=TaskStage.PROCESSING)
             
             if progress_msg:
-                await progress_msg.edit_text("<b>📦 Starting extraction with libarchive...</b>")
+                await progress_msg.edit_text("<b>📦 Starting extraction with bsdtar (libarchive)...</b>")
             
             # Extract archives
             extractor = LibArchiveExtractor(password=task.password, task_id=task.task_id)
@@ -2646,14 +2511,19 @@ Use /status to check your position.
             self.app.add_handler(CallbackQueryHandler(self.handle_callback))
             
             logger.info("Starting bot...")
+            print(f"\n{'='*50}")
             print(f"🤖 LOGS Extractor Bot starting...")
-            print(f"📊 Libarchive: {'✅' if HAS_LIBARCHIVE else '❌'}")
+            print(f"{'='*50}")
+            print(f"📊 Libarchive (bsdtar): {'✅ Found' if self.has_bsdtar else '❌ NOT FOUND'}")
+            if not self.has_bsdtar:
+                print(f"   ⚠️  Install: apt-get install libarchive-tools")
             print(f"⚡ Max concurrent: {MAX_CONCURRENT_USERS}")
             print(f"⏱️ Active timeout: {ACTIVE_TASK_TIMEOUT//60} minutes")
             print(f"📁 Downloads folder: downloads/[user_id]/")
             print(f"💳 CC Format: cc|mm/yyyy|cvv|name or cc|mm/yyyy|cvv")
             print(f"🔍 Single-pass extraction: cookies + cards at once")
             print(f"🚀 Bot is running! Press Ctrl+C to stop.")
+            print(f"{'='*50}\n")
             
             # Run the client
             self.app.run()
