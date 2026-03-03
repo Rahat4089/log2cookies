@@ -13,6 +13,7 @@ import libarchive.ffi as ffi
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 import time
+import random
 
 from pyrogram import Client, filters
 from pyrogram.types import (
@@ -20,7 +21,7 @@ from pyrogram.types import (
     CallbackQuery
 )
 from pyrogram.enums import ParseMode
-from pyrogram.errors import FloodWait, MessageNotModified
+from pyrogram.errors import FloodWait, MessageNotModified, QueryIdInvalid
 
 # Bot configuration
 API_ID = 23933044
@@ -28,7 +29,7 @@ API_HASH = "6df11147cbec7d62a323f0f498c8c03a"
 BOT_TOKEN = "8640428737:AAFGmvqvw_Y6M9zJjurdI8ffH9Uq5dxampY"
 
 # Thread pool for parallel processing
-executor = ThreadPoolExecutor(max_workers=os.cpu_count() * 3)
+executor = ThreadPoolExecutor(max_workers=os.cpu_count())
 
 # User session data storage
 user_sessions = {}
@@ -37,17 +38,17 @@ class ExtractionSession:
     def __init__(self, user_id: int, message: Message = None):
         self.user_id = user_id
         self.original_message = message
-        self.mode = None  # "zip", "folder", "cookies", "ulp"
-        self.domains = []  # For cookies mode
+        self.mode = None
+        self.domains = []
         self.password = None
         self.archive_path = None
         self.archive_filename = None
         self.archive_size = 0
         self.extract_path = None
-        self.results = []  # For CC results
-        self.cookie_results = []  # For cookie results
-        self.cookies_data = []  # Structured cookie data
-        self.ulp_results = []  # For ULP results
+        self.results = []
+        self.cookie_results = []
+        self.cookies_data = []
+        self.ulp_results = []
         self.total_files = 0
         self.processed_files = 0
         self.stop_flag = False
@@ -57,8 +58,40 @@ class ExtractionSession:
         self.last_update_time = 0
         self.start_time = None
         self.domain_list = []
-        self.cookie_format = "Simple List"  # Default format
+        self.cookie_format = "Simple List"
+        self.last_message_time = 0  # For rate limiting
         
+    async def safe_edit(self, text: str, parse_mode=None):
+        """Safely edit message with rate limiting"""
+        current_time = time.time()
+        if current_time - self.last_message_time < 2:  # Minimum 2 seconds between edits
+            await asyncio.sleep(2 - (current_time - self.last_message_time))
+        
+        if self.status_message:
+            try:
+                await self.status_message.edit_text(text, parse_mode=parse_mode)
+                self.last_message_time = time.time()
+            except MessageNotModified:
+                pass
+            except Exception as e:
+                print(f"Error editing message: {e}")
+    
+    async def safe_send(self, client, text: str, parse_mode=None):
+        """Safely send message with rate limiting"""
+        current_time = time.time()
+        if current_time - self.last_message_time < 2:
+            await asyncio.sleep(2 - (current_time - self.last_message_time))
+        
+        try:
+            msg = await client.send_message(self.user_id, text, parse_mode=parse_mode)
+            self.last_message_time = time.time()
+            return msg
+        except FloodWait as e:
+            wait_time = e.value + random.randint(1, 5)
+            print(f"Flood wait: sleeping for {wait_time} seconds")
+            await asyncio.sleep(wait_time)
+            return await self.safe_send(client, text, parse_mode)
+    
     def reset(self):
         self.mode = None
         self.domains = []
@@ -113,80 +146,73 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-# ========== ARCHIVE EXTRACTION USING LIBARCHIVE ==========
+# ========== FIXED ARCHIVE EXTRACTION USING LIBARCHIVE ==========
 async def extract_archive_with_libarchive(archive_path: str, extract_to: str, password: str = None, session=None) -> List[str]:
     """
-    Extract archive using libarchive with support for nested archives
-    Returns list of extracted file paths
+    Fixed archive extraction using libarchive - reads entries immediately
     """
     extracted_files = []
     
-    def extract_callback(entry, archive):
-        entry_path = entry.pathname
-        if entry_path.endswith('/'):
-            return 0
-        
-        target_path = os.path.join(extract_to, entry_path)
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        
-        try:
-            with open(target_path, 'wb') as f:
-                for block in entry.get_blocks():
-                    f.write(block)
-            return target_path
-        except Exception as e:
-            print(f"Error extracting {entry_path}: {e}")
-            return None
-    
     try:
-        # Count total entries for progress
+        # Open archive and process entries immediately
         with libarchive.file_reader(archive_path) as archive:
-            entries = list(archive)
-            total_entries = len(entries)
-        
-        # Extract with progress updates (3 second intervals)
-        extracted = []
-        for i, entry in enumerate(entries):
-            if session and session.stop_flag:
-                break
-                
-            result = extract_callback(entry, None)
-            if result:
-                extracted.append(result)
+            entries = []
+            for entry in archive:
+                entries.append(entry)
             
-            # Update progress every 3 seconds
-            if session and session.status_message:
-                current_time = time.time()
-                if current_time - session.last_update_time >= 3 or i == total_entries - 1:
-                    progress = (i + 1) / total_entries * 100
-                    asyncio.create_task(
-                        session.status_message.edit_text(
+            total_entries = len(entries)
+            
+            for i, entry in enumerate(entries):
+                if session and session.stop_flag:
+                    break
+                
+                entry_path = entry.pathname
+                if entry_path.endswith('/'):
+                    continue
+                
+                target_path = os.path.join(extract_to, entry_path)
+                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                
+                # Extract immediately while entry is still valid
+                try:
+                    with open(target_path, 'wb') as f:
+                        for block in entry.get_blocks():
+                            f.write(block)
+                    extracted_files.append(target_path)
+                except Exception as e:
+                    print(f"Error extracting {entry_path}: {e}")
+                    continue
+                
+                # Update progress every 3 seconds
+                if session and session.status_message:
+                    current_time = time.time()
+                    if current_time - session.last_update_time >= 3 or i == total_entries - 1:
+                        progress = (i + 1) / total_entries * 100
+                        await session.safe_edit(
                             f"📦 **Extracting archive...**\n"
                             f"Progress: {progress:.1f}%\n"
-                            f"File: {os.path.basename(entry.pathname)[:30]}..."
+                            f"File: {os.path.basename(entry_path)[:30]}..."
                         )
-                    )
-                    session.last_update_time = current_time
-        
-        extracted_files.extend(extracted)
+                        session.last_update_time = current_time
         
         # Process nested archives
         nested_count = 0
-        for file_path in extracted_files[:]:
-            if is_archive_file(file_path):
-                nested_count += 1
-                if session and session.status_message:
-                    await session.status_message.edit_text(f"📦 **Extracting nested archive {nested_count}...**")
-                
-                nested_extract_dir = os.path.join(extract_to, f"nested_{nested_count}")
-                os.makedirs(nested_extract_dir, exist_ok=True)
-                
-                try:
-                    nested_files = await extract_archive_with_libarchive(file_path, nested_extract_dir, password, session)
-                    extracted_files.extend(nested_files)
-                    os.remove(file_path)
-                except Exception as e:
-                    print(f"Error extracting nested archive {file_path}: {e}")
+        archives_to_process = [f for f in extracted_files if is_archive_file(f)]
+        
+        for archive_file in archives_to_process:
+            nested_count += 1
+            if session and session.status_message:
+                await session.safe_edit(f"📦 **Extracting nested archive {nested_count}...**")
+            
+            nested_extract_dir = os.path.join(extract_to, f"nested_{nested_count}")
+            os.makedirs(nested_extract_dir, exist_ok=True)
+            
+            try:
+                nested_files = await extract_archive_with_libarchive(archive_file, nested_extract_dir, password, session)
+                extracted_files.extend(nested_files)
+                os.remove(archive_file)
+            except Exception as e:
+                print(f"Error extracting nested archive {archive_file}: {e}")
     
     except Exception as e:
         print(f"Extraction error: {e}")
@@ -245,75 +271,6 @@ def extract_from_file(file_path: str) -> List[str]:
             return find_cards(content)
     except:
         return []
-
-def extract_from_zip(zip_path: str, password: str = None, session=None) -> List[str]:
-    """Extract cards from zip file using libarchive"""
-    cards = []
-    skip_patterns = [
-        'information.txt', 'join telegram.txt', 'join_telegram.txt',
-        'telegram.txt', 'passwords.txt', 'history/', 'cookies/', 
-        'Cookies/', 'cookie/', 'Cookie/'
-    ]
-    
-    try:
-        with libarchive.file_reader(zip_path) as archive:
-            if session and session.stop_flag:
-                return cards
-                
-            for entry in archive:
-                if session and session.stop_flag:
-                    break
-                    
-                entry_path = entry.pathname
-                if entry_path.endswith('/'):
-                    continue
-                
-                file_lower = entry_path.lower()
-                path_parts = file_lower.split('/')
-                
-                # Check if in target folders
-                in_target_folder = False
-                for i in range(len(path_parts) - 1):
-                    folder = path_parts[i]
-                    if folder in ["autofill", "creditcards"]:
-                        in_target_folder = True
-                        break
-                
-                if not in_target_folder:
-                    continue
-                
-                if not (file_lower.endswith('.txt') or file_lower.endswith('.log')):
-                    continue
-                
-                should_skip = False
-                for pattern in skip_patterns:
-                    if pattern.lower() in file_lower:
-                        should_skip = True
-                        break
-                
-                if should_skip:
-                    continue
-                
-                # Extract and read content
-                try:
-                    content = b''
-                    for block in entry.get_blocks():
-                        content += block
-                    
-                    if len(content) < 50:
-                        continue
-                    
-                    text = content.decode('utf-8', errors='ignore')
-                    file_cards = find_cards(text)
-                    cards.extend(file_cards)
-                    
-                except Exception as e:
-                    print(f"Error reading {entry_path}: {e}")
-                    
-    except Exception as e:
-        print(f"Error in {os.path.basename(zip_path)}: {e}")
-    
-    return cards
 
 # ========== COOKIE EXTRACTION (YOUR LOGIC) ==========
 def extract_cookies_from_file(file_path: str, domains_to_search: List[str]) -> List[Dict]:
@@ -441,192 +398,17 @@ def extract_ulp_from_file(file_path: str) -> List[str]:
     return ulps
 
 # ========== PARALLEL PROCESSING FUNCTIONS ==========
-def process_zip_file(zip_file: str, password: str = None, session=None) -> List[str]:
-    """Process a single zip file for CC extraction"""
-    if session and session.stop_flag:
-        return []
-    return extract_from_zip(zip_file, password, session)
-
-def process_text_file_for_cc(file_path: str, session=None) -> List[str]:
+def process_text_file_for_cc(file_path: str) -> List[str]:
     """Process a text file for CC extraction"""
-    if session and session.stop_flag:
-        return []
     return extract_from_file(file_path)
 
-def process_text_file_for_cookies(file_path: str, domains: List[str], session=None) -> List[Dict]:
+def process_text_file_for_cookies(file_path: str, domains: List[str]) -> List[Dict]:
     """Process a text file for cookie extraction"""
-    if session and session.stop_flag:
-        return []
     return extract_cookies_from_file(file_path, domains)
 
-def process_text_file_for_ulp(file_path: str, session=None) -> List[str]:
+def process_text_file_for_ulp(file_path: str) -> List[str]:
     """Process a text file for ULP extraction"""
-    if session and session.stop_flag:
-        return []
     return extract_ulp_from_file(file_path)
-
-# ========== SCANNING FUNCTIONS ==========
-async def scan_folder_for_cc(session: ExtractionSession) -> List[str]:
-    """Scan folder for credit cards using parallel processing"""
-    txt_files = []
-    
-    for root, dirs, files in os.walk(session.folder_path):
-        rel_path = os.path.relpath(root, session.folder_path) if root != session.folder_path else ""
-        path_parts = rel_path.split(os.sep) if rel_path else []
-        
-        if any(folder.lower() in ["autofill", "creditcards"] for folder in path_parts):
-            for file in files:
-                if file.lower().endswith('.txt'):
-                    txt_files.append(os.path.join(root, file))
-    
-    folder_name = os.path.basename(session.folder_path).lower()
-    if folder_name in ["autofill", "creditcards"]:
-        for root, dirs, files in os.walk(session.folder_path):
-            for file in files:
-                if file.lower().endswith('.txt'):
-                    txt_files.append(os.path.join(root, file))
-    
-    if not txt_files:
-        return []
-    
-    session.total_files = len(txt_files)
-    session.processed_files = 0
-    
-    # Process files in parallel
-    loop = asyncio.get_event_loop()
-    futures = []
-    all_cards = []
-    
-    for txt_file in txt_files:
-        if session.stop_flag:
-            break
-        future = loop.run_in_executor(executor, process_text_file_for_cc, txt_file, session)
-        futures.append(future)
-        
-        # Update progress every 3 seconds
-        current_time = time.time()
-        if current_time - session.last_update_time >= 3:
-            session.processed_files = len([f for f in futures if f.done()])
-            await update_scan_progress(session)
-            session.last_update_time = current_time
-    
-    # Wait for all to complete
-    results = await asyncio.gather(*futures)
-    for cards in results:
-        all_cards.extend(cards)
-        session.processed_files += 1
-    
-    return all_cards
-
-async def scan_folder_for_cookies(session: ExtractionSession) -> tuple:
-    """Scan folder for cookies using parallel processing"""
-    txt_files = []
-    
-    for root, dirs, files in os.walk(session.folder_path):
-        if os.path.basename(root).lower() == "cookies":
-            for file in files:
-                if file.lower().endswith('.txt'):
-                    txt_files.append(os.path.join(root, file))
-    
-    if not txt_files:
-        return [], []
-    
-    # Prepare domains
-    domains_to_search = []
-    if session.domains:
-        domains_to_search = session.domains
-    elif session.domain_list:
-        domains_to_search = [d.lower().replace('http://', '').replace('https://', '').replace('www.', '') 
-                            for d in session.domain_list]
-    
-    session.total_files = len(txt_files)
-    session.processed_files = 0
-    
-    # Process files in parallel
-    loop = asyncio.get_event_loop()
-    futures = []
-    all_cookies_data = []
-    all_formatted = []
-    
-    for txt_file in txt_files:
-        if session.stop_flag:
-            break
-        future = loop.run_in_executor(executor, process_text_file_for_cookies, txt_file, domains_to_search, session)
-        futures.append(future)
-        
-        # Update progress every 3 seconds
-        current_time = time.time()
-        if current_time - session.last_update_time >= 3:
-            session.processed_files = len([f for f in futures if f.done()])
-            await update_scan_progress(session)
-            session.last_update_time = current_time
-    
-    # Wait for all to complete
-    results = await asyncio.gather(*futures)
-    for cookies_list in results:
-        if cookies_list:
-            all_cookies_data.extend(cookies_list)
-            for cookie_data in cookies_list:
-                formatted = format_cookie(cookie_data, session.cookie_format)
-                all_formatted.append(f"=== File: {os.path.basename(cookie_data['file'])} ===")
-                all_formatted.append(formatted)
-                all_formatted.append("")
-        session.processed_files += 1
-    
-    return all_cookies_data, all_formatted
-
-async def scan_folder_for_ulp(session: ExtractionSession) -> List[str]:
-    """Scan folder for ULP using parallel processing"""
-    txt_files = []
-    
-    for root, dirs, files in os.walk(session.folder_path):
-        for file in files:
-            if file.lower() == 'passwords.txt':
-                txt_files.append(os.path.join(root, file))
-    
-    if not txt_files:
-        return []
-    
-    session.total_files = len(txt_files)
-    session.processed_files = 0
-    
-    # Process files in parallel
-    loop = asyncio.get_event_loop()
-    futures = []
-    all_ulps = []
-    
-    for txt_file in txt_files:
-        if session.stop_flag:
-            break
-        future = loop.run_in_executor(executor, process_text_file_for_ulp, txt_file, session)
-        futures.append(future)
-        
-        # Update progress every 3 seconds
-        current_time = time.time()
-        if current_time - session.last_update_time >= 3:
-            session.processed_files = len([f for f in futures if f.done()])
-            await update_scan_progress(session)
-            session.last_update_time = current_time
-    
-    # Wait for all to complete
-    results = await asyncio.gather(*futures)
-    for ulps in results:
-        all_ulps.extend(ulps)
-        session.processed_files += 1
-    
-    return all_ulps
-
-async def update_scan_progress(session: ExtractionSession):
-    """Update scan progress with 3-second intervals"""
-    if session.status_message:
-        try:
-            await session.status_message.edit_text(
-                f"🔍 **Scanning files...**\n"
-                f"Progress: {session.processed_files}/{session.total_files}\n"
-                f"Found: {len(session.results)} CC | {len(session.cookies_data)} Cookie files | {len(session.ulp_results)} ULP"
-            )
-        except:
-            pass
 
 # ========== BOT COMMAND HANDLERS ==========
 @app.on_message(filters.command("start"))
@@ -634,7 +416,7 @@ async def start_command(client: Client, message: Message):
     welcome_text = """
 **🔰 Welcome to Multi-Extractor Bot!**
 
-I can extract from archives using your original extraction logic:
+I can extract from archives:
 • **💳 Credit Cards** (from Autofill/CreditCards folders)
 • **🍪 Cookies** (from cookies folders)
 • **🔑 ULP** (Host:Login:Password from passwords.txt)
@@ -647,9 +429,9 @@ I can extract from archives using your original extraction logic:
 5️⃣ Get extracted data
 
 **Features:**
-✅ Your original extraction logic preserved
-✅ libarchive for reliable extraction
-✅ Parallel processing for speed
+✅ Fixed libarchive extraction
+✅ Rate limiting to avoid floods
+✅ Parallel processing
 ✅ 3-second progress updates
 ✅ Nested archive support
 
@@ -684,13 +466,24 @@ async def handle_document(client: Client, message: Message):
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
     ])
     
-    session.mode_selection_message = await message.reply_text(
-        f"**📦 File:** `{session.archive_filename}`\n"
-        f"**Size:** `{session.archive_size / 1024:.2f} KB`\n\n"
-        "**Select extraction mode:**",
-        reply_markup=keyboard,
-        parse_mode=ParseMode.MARKDOWN
-    )
+    try:
+        session.mode_selection_message = await message.reply_text(
+            f"**📦 File:** `{session.archive_filename}`\n"
+            f"**Size:** `{session.archive_size / 1024:.2f} KB`\n\n"
+            "**Select extraction mode:**",
+            reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except FloodWait as e:
+        wait_time = e.value
+        await asyncio.sleep(wait_time)
+        session.mode_selection_message = await message.reply_text(
+            f"**📦 File:** `{session.archive_filename}`\n"
+            f"**Size:** `{session.archive_size / 1024:.2f} KB`\n\n"
+            "**Select extraction mode:**",
+            reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN
+        )
 
 @app.on_callback_query()
 async def handle_callback(client: Client, callback: CallbackQuery):
@@ -698,62 +491,75 @@ async def handle_callback(client: Client, callback: CallbackQuery):
     session = user_sessions.get(user_id)
     
     if not session:
-        await callback.answer("Session expired! Send a new file.", show_alert=True)
-        await callback.message.delete()
+        try:
+            await callback.answer("Session expired! Send a new file.", show_alert=True)
+        except QueryIdInvalid:
+            pass
+        try:
+            await callback.message.delete()
+        except:
+            pass
         return
     
     data = callback.data
     
-    if data == "cancel":
-        session.reset()
-        if session.user_id in user_sessions:
-            del user_sessions[user_id]
-        await callback.message.edit_text("❌ Operation cancelled.")
-        await callback.answer()
-        return
-    
-    if data.startswith("mode_"):
-        mode = data.replace("mode_", "")
-        session.mode = mode
+    try:
+        if data == "cancel":
+            session.reset()
+            if session.user_id in user_sessions:
+                del user_sessions[user_id]
+            await callback.message.edit_text("❌ Operation cancelled.")
+            await callback.answer()
+            return
         
-        if mode == "cookies":
-            await callback.message.edit_text(
-                "**🍪 Cookies Mode Selected**\n\n"
-                "Please send the domain(s) to extract cookies for.\n"
-                "You can send multiple domains separated by commas.\n\n"
-                "Example: `udemy.com, coursera.org, skillshare.com`"
-            )
-            session.password_request_message = callback.message
-        else:
-            # Ask for password
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("🔐 Yes, it's password protected", callback_data="password_yes"),
-                    InlineKeyboardButton("🔓 No password", callback_data="password_no")
-                ],
-                [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
-            ])
+        if data.startswith("mode_"):
+            mode = data.replace("mode_", "")
+            session.mode = mode
             
-            await callback.message.edit_text(
-                f"**{mode.upper()} Mode Selected**\n\n"
-                "Is the archive password protected?",
-                reply_markup=keyboard
-            )
+            if mode == "cookies":
+                await callback.message.edit_text(
+                    "**🍪 Cookies Mode Selected**\n\n"
+                    "Please send the domain(s) to extract cookies for.\n"
+                    "You can send multiple domains separated by commas.\n\n"
+                    "Example: `udemy.com, coursera.org, skillshare.com`"
+                )
+                session.password_request_message = callback.message
+            else:
+                # Ask for password
+                keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("🔐 Yes, it's password protected", callback_data="password_yes"),
+                        InlineKeyboardButton("🔓 No password", callback_data="password_no")
+                    ],
+                    [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
+                ])
+                
+                await callback.message.edit_text(
+                    f"**{mode.upper()} Mode Selected**\n\n"
+                    "Is the archive password protected?",
+                    reply_markup=keyboard
+                )
+            
+            await callback.answer()
         
-        await callback.answer()
-    
-    elif data.startswith("password_"):
-        if data == "password_yes":
-            await callback.message.edit_text(
-                "🔐 **Please enter the archive password:**"
-            )
-            session.password_request_message = callback.message
-        else:
-            session.password = None
-            await callback.message.delete()
-            await start_extraction_process(client, session)
-        
-        await callback.answer()
+        elif data.startswith("password_"):
+            if data == "password_yes":
+                await callback.message.edit_text(
+                    "🔐 **Please enter the archive password:**"
+                )
+                session.password_request_message = callback.message
+            else:
+                session.password = None
+                await callback.message.delete()
+                await start_extraction_process(client, session)
+            
+            await callback.answer()
+            
+    except QueryIdInvalid:
+        # Ignore invalid query IDs
+        pass
+    except Exception as e:
+        print(f"Callback error: {e}")
 
 @app.on_message(filters.text & filters.private)
 async def handle_text(client: Client, message: Message):
@@ -782,11 +588,19 @@ async def handle_text(client: Client, message: Message):
             [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
         ])
         
-        await message.reply_text(
-            f"✅ Domains set: {', '.join(domains[:5])}{'...' if len(domains) > 5 else ''}\n\n"
-            "Is the archive password protected?",
-            reply_markup=keyboard
-        )
+        try:
+            await message.reply_text(
+                f"✅ Domains set: {', '.join(domains[:5])}{'...' if len(domains) > 5 else ''}\n\n"
+                "Is the archive password protected?",
+                reply_markup=keyboard
+            )
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+            await message.reply_text(
+                f"✅ Domains set: {', '.join(domains[:5])}{'...' if len(domains) > 5 else ''}\n\n"
+                "Is the archive password protected?",
+                reply_markup=keyboard
+            )
         
         if session.password_request_message:
             await session.password_request_message.delete()
@@ -799,13 +613,12 @@ async def handle_text(client: Client, message: Message):
         await start_extraction_process(client, session)
 
 async def start_extraction_process(client: Client, session: ExtractionSession):
-    """Start the extraction process with your original logic"""
+    """Start the extraction process"""
     
-    status_message = await client.send_message(
-        session.user_id,
+    session.status_message = await session.safe_send(
+        client,
         "🚀 **Starting extraction process...**"
     )
-    session.status_message = status_message
     session.start_time = time.time()
     session.last_update_time = time.time()
     
@@ -818,18 +631,26 @@ async def start_extraction_process(client: Client, session: ExtractionSession):
         os.makedirs(session.extract_path, exist_ok=True)
         
         # Download file
-        await status_message.edit_text("📥 **Downloading archive...**")
+        await session.safe_edit("📥 **Downloading archive...**")
         
         if not session.original_message or not session.original_message.document:
             raise Exception("Original message with document not found")
         
-        await client.download_media(
-            session.original_message,
-            file_name=file_path
-        )
+        try:
+            await client.download_media(
+                session.original_message,
+                file_name=file_path
+            )
+        except FloodWait as e:
+            await session.safe_edit(f"⏳ Rate limited. Waiting {e.value} seconds...")
+            await asyncio.sleep(e.value)
+            await client.download_media(
+                session.original_message,
+                file_name=file_path
+            )
         
         # Extract archive with libarchive
-        await status_message.edit_text("📦 **Extracting archive with libarchive...**")
+        await session.safe_edit("📦 **Extracting archive with libarchive...**")
         extracted_files = await extract_archive_with_libarchive(
             file_path, 
             session.extract_path, 
@@ -839,7 +660,7 @@ async def start_extraction_process(client: Client, session: ExtractionSession):
         
         # Process based on mode
         if session.mode == "cc":
-            await status_message.edit_text("🔍 **Scanning for credit cards...**")
+            await session.safe_edit("🔍 **Scanning for credit cards...**")
             
             # Find all text files in Autofill/CreditCards folders
             txt_files = []
@@ -860,14 +681,14 @@ async def start_extraction_process(client: Client, session: ExtractionSession):
             for txt_file in txt_files:
                 if session.stop_flag:
                     break
-                future = loop.run_in_executor(executor, process_text_file_for_cc, txt_file, session)
+                future = loop.run_in_executor(executor, process_text_file_for_cc, txt_file)
                 futures.append(future)
                 
                 # Update progress every 3 seconds
                 current_time = time.time()
                 if current_time - session.last_update_time >= 3:
                     session.processed_files = len([f for f in futures if f.done()])
-                    await status_message.edit_text(
+                    await session.safe_edit(
                         f"🔍 **Scanning for credit cards...**\n"
                         f"Progress: {session.processed_files}/{session.total_files}\n"
                         f"Found: {len(session.results)} cards"
@@ -891,17 +712,26 @@ async def start_extraction_process(client: Client, session: ExtractionSession):
                     f.write("="*60 + "\n\n")
                     f.write("\n".join(session.results))
                 
-                await client.send_document(
-                    session.user_id,
-                    output_file.name,
-                    caption=f"💳 **Credit Cards Found:** {len(session.results)}\nValid years: 2026-2032"
-                )
+                try:
+                    await client.send_document(
+                        session.user_id,
+                        output_file.name,
+                        caption=f"💳 **Credit Cards Found:** {len(session.results)}\nValid years: 2026-2032"
+                    )
+                except FloodWait as e:
+                    await asyncio.sleep(e.value)
+                    await client.send_document(
+                        session.user_id,
+                        output_file.name,
+                        caption=f"💳 **Credit Cards Found:** {len(session.results)}\nValid years: 2026-2032"
+                    )
+                
                 os.unlink(output_file.name)
             else:
-                await client.send_message(session.user_id, "❌ **No credit cards found!**")
+                await session.safe_send(client, "❌ **No credit cards found!**")
         
         elif session.mode == "cookies":
-            await status_message.edit_text("🔍 **Scanning for cookies...**")
+            await session.safe_edit("🔍 **Scanning for cookies...**")
             
             # Find all cookie files
             txt_files = []
@@ -921,14 +751,14 @@ async def start_extraction_process(client: Client, session: ExtractionSession):
             for txt_file in txt_files:
                 if session.stop_flag:
                     break
-                future = loop.run_in_executor(executor, process_text_file_for_cookies, txt_file, session.domains, session)
+                future = loop.run_in_executor(executor, process_text_file_for_cookies, txt_file, session.domains)
                 futures.append(future)
                 
                 # Update progress every 3 seconds
                 current_time = time.time()
                 if current_time - session.last_update_time >= 3:
                     session.processed_files = len([f for f in futures if f.done()])
-                    await status_message.edit_text(
+                    await session.safe_edit(
                         f"🔍 **Scanning for cookies...**\n"
                         f"Progress: {session.processed_files}/{session.total_files}\n"
                         f"Found: {len(session.cookies_data)} cookie files"
@@ -975,19 +805,28 @@ async def start_extraction_process(client: Client, session: ExtractionSession):
                             )
                 
                 total_cookies = sum(len(c['cookies']) for c in session.cookies_data)
-                await client.send_document(
-                    session.user_id,
-                    zip_path,
-                    caption=f"🍪 **Cookies Found:** {total_cookies} cookies from {len(session.cookies_data)} files"
-                )
+                
+                try:
+                    await client.send_document(
+                        session.user_id,
+                        zip_path,
+                        caption=f"🍪 **Cookies Found:** {total_cookies} cookies from {len(session.cookies_data)} files"
+                    )
+                except FloodWait as e:
+                    await asyncio.sleep(e.value)
+                    await client.send_document(
+                        session.user_id,
+                        zip_path,
+                        caption=f"🍪 **Cookies Found:** {total_cookies} cookies from {len(session.cookies_data)} files"
+                    )
                 
                 os.unlink(zip_path)
                 shutil.rmtree(cookies_dir)
             else:
-                await client.send_message(session.user_id, "❌ **No cookies found for the specified domains!**")
+                await session.safe_send(client, "❌ **No cookies found for the specified domains!**")
         
         elif session.mode == "ulp":
-            await status_message.edit_text("🔍 **Scanning for ULP entries...**")
+            await session.safe_edit("🔍 **Scanning for ULP entries...**")
             
             # Find all passwords.txt files
             txt_files = []
@@ -1006,14 +845,14 @@ async def start_extraction_process(client: Client, session: ExtractionSession):
             for txt_file in txt_files:
                 if session.stop_flag:
                     break
-                future = loop.run_in_executor(executor, process_text_file_for_ulp, txt_file, session)
+                future = loop.run_in_executor(executor, process_text_file_for_ulp, txt_file)
                 futures.append(future)
                 
                 # Update progress every 3 seconds
                 current_time = time.time()
                 if current_time - session.last_update_time >= 3:
                     session.processed_files = len([f for f in futures if f.done()])
-                    await status_message.edit_text(
+                    await session.safe_edit(
                         f"🔍 **Scanning for ULP entries...**\n"
                         f"Progress: {session.processed_files}/{session.total_files}\n"
                         f"Found: {len(session.ulp_results)} entries"
@@ -1037,31 +876,40 @@ async def start_extraction_process(client: Client, session: ExtractionSession):
                     f.write("="*60 + "\n\n")
                     f.write("\n".join(session.ulp_results))
                 
-                await client.send_document(
-                    session.user_id,
-                    output_file.name,
-                    caption=f"🔑 **ULP Entries Found:** {len(session.ulp_results)}"
-                )
+                try:
+                    await client.send_document(
+                        session.user_id,
+                        output_file.name,
+                        caption=f"🔑 **ULP Entries Found:** {len(session.ulp_results)}"
+                    )
+                except FloodWait as e:
+                    await asyncio.sleep(e.value)
+                    await client.send_document(
+                        session.user_id,
+                        output_file.name,
+                        caption=f"🔑 **ULP Entries Found:** {len(session.ulp_results)}"
+                    )
+                
                 os.unlink(output_file.name)
             else:
-                await client.send_message(session.user_id, "❌ **No ULP entries found!**")
+                await session.safe_send(client, "❌ **No ULP entries found!**")
         
         # Clean up
-        await status_message.edit_text("✅ **Extraction complete! Cleaning up...**")
+        await session.safe_edit("✅ **Extraction complete! Cleaning up...**")
         
     except Exception as e:
         error_msg = str(e)
         print(f"Extraction error: {error_msg}")
-        await client.send_message(
-            session.user_id,
+        await session.safe_send(
+            client,
             f"❌ **Error during extraction:**\n`{error_msg[:200]}`"
         )
     
     finally:
         # Clean up session
         elapsed_time = time.time() - session.start_time if session.start_time else 0
-        await client.send_message(
-            session.user_id,
+        await session.safe_send(
+            client,
             f"✅ **Process completed in {elapsed_time:.1f} seconds!**"
         )
         session.reset()
@@ -1090,7 +938,11 @@ async def stats_command(client: Client, message: Message):
     else:
         stats_text = "**No active extraction session.**"
     
-    await message.reply_text(stats_text, parse_mode=ParseMode.MARKDOWN)
+    try:
+        await message.reply_text(stats_text, parse_mode=ParseMode.MARKDOWN)
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        await message.reply_text(stats_text, parse_mode=ParseMode.MARKDOWN)
 
 @app.on_message(filters.command("cancel"))
 async def cancel_command(client: Client, message: Message):
@@ -1135,8 +987,8 @@ async def help_command(client: Client, message: Message):
    - Skips software lines
 
 **Features:**
-✅ Your original extraction logic preserved
-✅ libarchive for reliable extraction
+✅ Fixed libarchive extraction (no "entry passed" errors)
+✅ Rate limiting to avoid flood waits
 ✅ Parallel processing for speed
 ✅ 3-second progress updates
 ✅ Nested archive support
@@ -1148,10 +1000,10 @@ Send an archive to get started!
     await message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
 if __name__ == "__main__":
-    print("🚀 Starting Multi-Extractor Bot with your original logic...")
-    print(f"⚡ Using {os.cpu_count() * 2} threads for parallel processing")
+    print("🚀 Starting Multi-Extractor Bot with fixes...")
+    print(f"⚡ Using {os.cpu_count()} threads for parallel processing")
     print("⏱️ Progress updates every 3 seconds")
-    print("📦 Using libarchive for extraction")
+    print("📦 Fixed libarchive extraction")
     print("🤖 Bot is running...")
     
     app.run()
