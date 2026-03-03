@@ -1,21 +1,20 @@
+# Use Python 3.11 slim image
 FROM python:3.11-slim
 
+# Set working directory
 WORKDIR /app
 
-# Install system dependencies for libarchive
+# Install libarchive-dev system dependency
 RUN apt-get update && apt-get install -y \
     libarchive-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install Python dependencies
+# Copy requirements and install Python modules
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy bot code
-COPY bot.py .
+# Copy bot script
 COPY start.py .
-# Create necessary directories
-RUN mkdir -p downloads logs
 
 # Run the bot
 CMD ["python", "start.py"]
