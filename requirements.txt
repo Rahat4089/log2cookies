@@ -1,9 +1,5 @@
 pyrofork
-aiohttp
-aiofiles
-tqdm
-colorama
-psutil
+tgcrypto
 libarchive-c
 gunicorn
 flask
