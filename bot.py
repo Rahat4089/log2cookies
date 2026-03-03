@@ -25,7 +25,7 @@ from pyrogram.errors import FloodWait, MessageNotModified
 # Bot configuration
 API_ID = 23933044
 API_HASH = "6df11147cbec7d62a323f0f498c8c03a"
-BOT_TOKEN = "8640428737:AAELyJIu3sWBUYhpJY_tcPzcDbbtd9K6bY8"
+BOT_TOKEN = "8640428737:AAFGmvqvw_Y6M9zJjurdI8ffH9Uq5dxampY"
 
 # Thread pool for parallel processing
 executor = ThreadPoolExecutor(max_workers=os.cpu_count() * 3)
