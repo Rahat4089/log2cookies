@@ -1,5 +1,7 @@
 pyrofork
 tgcrypto
-libarchive-c
+rarfile
+py7zr
+patoolib
 gunicorn
 flask
