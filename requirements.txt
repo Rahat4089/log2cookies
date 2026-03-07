@@ -2,6 +2,6 @@ pyrofork
 tgcrypto
 rarfile
 py7zr
-patoolib
+patool
 gunicorn
 flask
