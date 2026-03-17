@@ -1,5 +1,4 @@
 pyrofork
 tgcrypto
-tarfile
 aiohttp
 aiofiles
