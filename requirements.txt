@@ -1,7 +1,5 @@
 pyrofork
 tgcrypto
-rarfile
-py7zr
-patool
-gunicorn
-flask
+tarfile
+aiohttp
+aiofiles
