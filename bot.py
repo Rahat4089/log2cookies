@@ -23,8 +23,7 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 # Configuration - YOU MUST FILL THESE!
 API_ID = 28724954  # Get from https://my.telegram.org
 API_HASH = "3ac42791738b153a980e2cdabf97e02f"  # Get from https://my.telegram.org
-BOT_TOKEN = "8640428737:AAEGIaJWxm9dMFBcM2aKTrbgE8Oo47aQdvk"  # Get from @BotFather
-
+BOT_TOKEN = "8640428737:AAG5WAfwDOlBERALfacOJ_ht25_Kic217Us"
 # Initialize bot
 app = Client("cc_extractor_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
